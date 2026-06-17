@@ -27,8 +27,21 @@ public protocol MTPSpeculativeModel: LanguageModel {
         _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int
     ) -> (logits: MLXArray, hidden: MLXArray)
 
+    /// Prefill-only forward: warm the cache and return the pre-norm hidden state, skipping the LM
+    /// head (the logits are discarded during prefill). Avoids a wasted [1, chunk, vocab] matmul per
+    /// prefill chunk. Default implementation falls back to `backboneWithHidden`'s hidden.
+    func prefillBackbone(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+
     /// Run the MTP head on a pre-norm hidden state + next-token ids → logits (B, N, vocab).
     func mtpForward(
         _ hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache?]?
     ) -> MLXArray
+}
+
+extension MTPSpeculativeModel {
+    /// Default: derive the hidden from `backboneWithHidden` (still computes the wasted LM head).
+    /// Conformers should override to skip the LM head for a real prefill speedup.
+    public func prefillBackbone(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        backboneWithHidden(inputs, cache: cache, nConfirmed: 0).hidden
+    }
 }

@@ -64,6 +64,30 @@ final class GatedDeltaKernelTests: XCTestCase {
         XCTAssertLessThan(maxDiff(sK, sO), 2e-3)
     }
 
+    /// BENCHMARK (Step A baseline): time the current sequential fused kernel at real Qwen3.5
+    /// GatedDeltaNet dims (Hv=64, Hk=16, Dk=192, Dv=128) across prefill lengths. This is the
+    /// scoreboard the chunkwise prefill path must beat. Run with:
+    ///   xcodebuild test ... -only-testing:MLXLMTests/GatedDeltaKernelTests/testBenchmarkPrefill
+    func testBenchmarkPrefill() throws {
+        try XCTSkipUnless(Device.defaultDevice().deviceType == .gpu, "kernel needs GPU")
+        let Hv = 64, Hk = 16, Dk = 192, Dv = 128
+        for T in [512, 2048, 8192] {
+            let (q, k, v, g, beta, state) = makeInputs(B: 1, T: T, Hk: Hk, Hv: Hv, Dk: Dk, Dv: Dv)
+            // Warm up (kernel compile + allocations).
+            let (yw, sw) = gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state)
+            eval(yw, sw)
+            let runs = 5
+            let t0 = Date()
+            for _ in 0 ..< runs {
+                let (y, s) = gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state)
+                eval(y, s)
+            }
+            let ms = Date().timeIntervalSince(t0) / Double(runs) * 1000
+            let tps = Double(T) / (ms / 1000)
+            print(String(format: "[GDN-BENCH] seq T=%5d  %.1f ms  %.0f tok/s", T, ms, tps))
+        }
+    }
+
     /// Splitting a sequence and running it as two consecutive chunks (threading state through) must
     /// equal running the whole sequence at once — the property the MTP nConfirmed verify split and
     /// prefix-cache restore both rely on.

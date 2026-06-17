@@ -1195,6 +1195,16 @@ enum Qwen35Language {
             return (logits, hidden)
         }
 
+        /// Prefill-only forward: warms the cache and returns the pre-norm hidden states WITHOUT the
+        /// LM head. Prefill discards the logits (it only needs the cache warmed), so computing
+        /// `lmHead(norm(hidden))` — a [1, chunk, vocab] matmul against a ~150k vocab per chunk — is
+        /// pure waste. This skips it.
+        func prefillBackbone(_ inputs: MLXArray, cache: [KVCache?]?) -> MLXArray {
+            model(
+                inputs, inputsEmbeds: nil, cache: cache, positionIds: nil,
+                nConfirmed: 0, applyNorm: false)
+        }
+
         /// Run the MTP head on a pre-norm hidden state + next-token ids → logits (B, N, vocab).
         /// The head applies its own `mtp.norm`; the shared lm_head maps to logits (no model.norm).
         func mtpForward(
@@ -1601,6 +1611,10 @@ extension Qwen35: MTPSpeculativeModel {
     ) -> (logits: MLXArray, hidden: MLXArray) {
         languageModel.backboneWithHidden(
             inputs, cache: cache?.map { $0 as KVCache? }, nConfirmed: nConfirmed)
+    }
+
+    public func prefillBackbone(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel.prefillBackbone(inputs, cache: cache?.map { $0 as KVCache? })
     }
 
     public func mtpForward(

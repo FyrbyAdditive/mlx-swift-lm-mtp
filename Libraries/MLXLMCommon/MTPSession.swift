@@ -25,7 +25,7 @@ public final class MTPSession: @unchecked Sendable {
     private let continuation: AsyncStream<Generation>.Continuation
 
     // Caches (working copies; the scheduler/engine handles snapshot reuse via `result`).
-    private let modelCache: [KVCache]
+    private var modelCache: [KVCache]  // var: KV-quantized in place during prefill when kvBits set
     private let mtpCache: [KVCache]
 
     // Prompt + prefill bookkeeping.
@@ -189,10 +189,17 @@ public final class MTPSession: @unchecked Sendable {
         var n = min(prefillStep, prefillTotal - 1)
         if snapshotAt > prefilled && snapshotAt < prefilled + n { n = snapshotAt - prefilled }
         let chunk = prefillY[0 ..< n]
-        let (_, _) = model.backboneWithHidden(
-            chunk.expandedDimensions(axis: 0), cache: modelCache, nConfirmed: 0)
-        // MTP head intentionally NOT warmed during prefill (cold MTP cache self-warms in decode;
-        // output is backbone-only — see MTPGenerate.swift).
+        // Prefill only needs the cache warmed; the logits are discarded. Use prefillBackbone, which
+        // skips the LM head (a wasted [1, chunk, vocab] matmul per chunk). MTP head also not warmed
+        // (cold MTP cache self-warms in decode; output is backbone-only — see MTPGenerate.swift).
+        _ = model.prefillBackbone(chunk.expandedDimensions(axis: 0), cache: modelCache)
+        // Quantize the full-attention layers' KV in place once past `quantizedKVStart` (no-op when
+        // kvBits is nil; skips the GatedDeltaNet MambaCache layers). Shrinks the live cache AND the
+        // prefix snapshot taken below. QuantizedKVCache supports copy()/trim(), so snapshot reuse and
+        // MTP draft rollback still hold.
+        maybeQuantizeKVCache(
+            cache: &modelCache, kvBits: parameters.kvBits, kvGroupSize: parameters.kvGroupSize,
+            quantizedKVStart: parameters.quantizedKVStart)
         eval(modelCache.map { $0.state }.flatMap { $0 })
         prefillY = prefillY[n...]
         prefillTotal -= n
