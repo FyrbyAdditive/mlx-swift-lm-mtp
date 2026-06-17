@@ -771,14 +771,21 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // (including MTP ones) must not be double-shifted.
         let shouldShiftNormWeights = hasUnsanitizedConv1d
 
-        // Keep MTP weights when this model has an MTP head; drop them otherwise.
+        // Keep MTP weights when this model has an MTP head; drop them otherwise. When the head is
+        // built but the checkpoint carries no `mtp.*` weights (e.g. a backbone whose MTP head is
+        // supplied separately by a drafter), seed the head's params from its init values so loading
+        // doesn't fail on missing keys — the drafter overwrites them. Never crash here: `sanitize`
+        // can't throw, and a genuinely incompatible checkpoint should surface as a recoverable
+        // weight-verification error, not a fatalError.
         var weights = weights
-        if mtp == nil {
+        if let mtp {
+            if !weights.keys.contains(where: { $0.contains(".mtp.") || $0.hasPrefix("mtp.") }) {
+                for (suffix, value) in mtp.parameters().flattened() {
+                    weights["mtp.\(suffix)"] = value
+                }
+            }
+        } else {
             weights = weights.filter { !$0.key.contains("mtp.") }
-        } else if !weights.keys.contains(where: { $0.contains("mtp.") }) {
-            fatalError(
-                "Config specifies mtp_num_hidden_layers > 0 but the weights contain no MTP "
-                    + "parameters. Set mtp_num_hidden_layers=0 to disable MTP.")
         }
 
         if configuration.tieWordEmbeddings {
