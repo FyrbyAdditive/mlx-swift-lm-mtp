@@ -35,6 +35,9 @@ public final class MTPSession: @unchecked Sendable {
     private let snapshotAt: Int
     /// Token granularity for block-aligned prefix-snapshot capture (configurable; default 512).
     private let snapshotBlock: Int
+    /// The most-recent cached prompt's tokens, used to place this request's single snapshot at the
+    /// block-aligned length of the SHARED prefix (the recurring system prompt). Empty if none cached.
+    private let referenceTokens: [Int32]
     private let result: MTPCacheResult?
     private var prefillY: MLXArray
     private var prefillTotal: Int
@@ -76,6 +79,7 @@ public final class MTPSession: @unchecked Sendable {
         skipPrefill: Int,
         snapshotAt: Int,
         snapshotBlock: Int = 512,
+        referenceTokens: [Int32] = [],
         stopTokenIds: Set<Int>,
         continuation: AsyncStream<Generation>.Continuation,
         result: MTPCacheResult?
@@ -95,6 +99,7 @@ public final class MTPSession: @unchecked Sendable {
         self.skipPrefill = skipPrefill
         self.snapshotAt = snapshotAt
         self.snapshotBlock = max(1, snapshotBlock)
+        self.referenceTokens = referenceTokens
         self.result = result
         self.detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
 
@@ -189,21 +194,18 @@ public final class MTPSession: @unchecked Sendable {
     /// Run ONE prefill chunk. Returns true while more prefill remains. Must be called inside the
     /// container. When prefill completes, transitions to `.decoding`.
     ///
-    /// Captures a prefix snapshot at every `snapshotBlock`-aligned boundary it crosses (plus the
-    /// final tail at `snapshotAt`). Block-aligned boundaries mean a FUTURE request that shares only a
-    /// prefix of this prompt (e.g. the same system prompt, then different user text) can reuse the
-    /// largest block boundary ≤ the shared length — instead of missing because our single snapshot
-    /// landed at an arbitrary `promptLen−256` inside the divergent tail. Each snapshot is a complete
-    /// SSM checkpoint ending exactly at that boundary, so whole-prefix reuse stays exact.
+    /// Captures EXACTLY ONE prefix snapshot per request, at `captureBoundary` — the largest
+    /// `snapshotBlock`-aligned position < promptLen. Block-aligning the single snapshot lets a FUTURE
+    /// request that shares a prefix (same system prompt, different user text) reuse it, while keeping
+    /// the cost to one copy per request. (An earlier version captured at EVERY boundary — ~100 copies
+    /// of the growing KV for a 55k prompt — which blew RAM to tens of GB; that was the regression.)
     public func prefillStepOnce() -> Bool {
         if prefillStart == nil { prefillStart = Date() }
         guard prefillTotal > 1 else { finishPrefill(); return false }
         var n = min(prefillStep, prefillTotal - 1)
-        // Stop the chunk on the next capture boundary (block-aligned, or the tail snapshotAt) so the
-        // cache encodes exactly that many tokens when we snapshot.
-        if let next = nextCaptureBoundary(after: prefilled), next < prefilled + n {
-            n = next - prefilled
-        }
+        // Stop the chunk exactly on the capture boundary so the cache encodes exactly that many
+        // tokens when we snapshot.
+        if let b = captureBoundary, b > prefilled, b < prefilled + n { n = b - prefilled }
         let chunk = prefillY[0 ..< n]
         // Prefill only needs the cache warmed; the logits are discarded. Use prefillBackbone, which
         // skips the LM head (a wasted [1, chunk, vocab] matmul per chunk). MTP head also not warmed
@@ -211,7 +213,7 @@ public final class MTPSession: @unchecked Sendable {
         _ = model.prefillBackbone(chunk.expandedDimensions(axis: 0), cache: modelCache)
         // Quantize the full-attention layers' KV in place once past `quantizedKVStart` (no-op when
         // kvBits is nil; skips the GatedDeltaNet MambaCache layers). Shrinks the live cache AND the
-        // prefix snapshots taken below. QuantizedKVCache supports copy()/trim(), so snapshot reuse and
+        // prefix snapshot taken below. QuantizedKVCache supports copy()/trim(), so snapshot reuse and
         // MTP draft rollback still hold.
         maybeQuantizeKVCache(
             cache: &modelCache, kvBits: parameters.kvBits, kvGroupSize: parameters.kvGroupSize,
@@ -220,37 +222,38 @@ public final class MTPSession: @unchecked Sendable {
         prefillY = prefillY[n...]
         prefillTotal -= n
         prefilled += n
-        // Capture at a block boundary or the tail snapshotAt (each captured once).
-        if shouldCapture(at: prefilled), !capturedAt.contains(prefilled) {
-            capturedAt.insert(prefilled)
+        // The single snapshot, taken once exactly at the block boundary.
+        if let b = captureBoundary, prefilled == b, !captured {
+            captured = true
             pendingSnapshots.append((
-                Array(promptTokens.asArray(Int32.self).prefix(prefilled)),
+                Array(promptTokensArray.prefix(b)),
                 modelCache.map { $0.copy() }, mtpCache.map { $0.copy() }))
         }
         if prefillTotal <= 1 { finishPrefill(); return false }
         return true
     }
 
-    /// The next token position at/after `pos` where we want to capture a snapshot: the next
-    /// block-aligned boundary, or the tail `snapshotAt`, whichever comes first (and is a valid
-    /// capture point). Returns nil if none remain before the prompt end.
-    private func nextCaptureBoundary(after pos: Int) -> Int? {
-        var cands: [Int] = []
-        let nextBlock = ((pos / snapshotBlock) + 1) * snapshotBlock
-        if nextBlock < promptCount { cands.append(nextBlock) }
-        if snapshotAt > pos, snapshotAt < promptCount { cands.append(snapshotAt) }
-        return cands.min()
-    }
+    /// The single block-aligned position to snapshot: the largest multiple of `snapshotBlock` that is
+    /// ≥ minReuse, > what we restored, and < promptLen (so a non-empty suffix remains — `reuseCount`
+    /// requires the snapshot be strictly shorter than any prompt sharing it). nil = nothing worth
+    /// snapshotting (prompt too short).
+    ///
+    /// Placed at the block-aligned length of the prefix this prompt SHARES with the most-recent
+    /// cached prompt (`referenceTokens`) — i.e. the stable region (system prompt) likely to recur —
+    /// so a future request sharing that region reuses it. Falls back to the largest block boundary
+    /// below the prompt when there's no reference yet (first request of a family) so request #2 has
+    /// something to match; request #2 then snapshots at the now-known shared boundary.
+    private lazy var captureBoundary: Int? = {
+        let shared = MTPCacheReuse.commonPrefixLength(referenceTokens, promptTokensArray)
+        let target = shared >= snapshotBlock ? shared : (promptCount - 1)
+        let b = (target / snapshotBlock) * snapshotBlock
+        return (b >= 16 && b > skipPrefill && b < promptCount) ? b : nil
+    }()
 
-    /// Capture at a position iff it's a block boundary (≥ minReuse, < promptCount) or the tail
-    /// snapshotAt. Leaves a non-empty suffix so the snapshot is strictly shorter than any prompt
-    /// that shares it (reuseCount requires that).
-    private func shouldCapture(at pos: Int) -> Bool {
-        guard pos < promptCount, pos >= 16 else { return false }
-        return pos == snapshotAt || pos % snapshotBlock == 0
-    }
+    /// Cached host copy of the prompt tokens (avoids re-reading the MLXArray each boundary check).
+    private lazy var promptTokensArray: [Int32] = promptTokens.asArray(Int32.self)
 
-    private var capturedAt: Set<Int> = []
+    private var captured = false
 
     private func finishPrefill() {
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
