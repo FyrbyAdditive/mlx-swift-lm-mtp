@@ -38,7 +38,9 @@ public func mtpGenerate(
         let input = boxedInput.consume()
         // safe: guarded above
         let model = context.model as! any MTPSpeculativeModel
-        let promptTokens = input.text.tokens
+        // The processor yields batched tokens (shape [1, seqLen]); flatten to a 1-D [seqLen]
+        // sequence so the prefill/decode slicing + `expandedDimensions(axis: 0)` produce [1, n].
+        let promptTokens = input.text.tokens.reshaped([-1])
         let start = Date()
         let promptCount = promptTokens.dim(-1)
 
@@ -126,12 +128,12 @@ public func mtpGenerate(
                     let chunk = y[0 ..< n]
                     let (_, hidden) = model.backboneWithHidden(
                         chunk.expandedDimensions(axis: 0), cache: modelCache, nConfirmed: 0)
-                    // Warm the MTP cache with the *next* tokens (shift +1).
+                    // Warm the MTP cache: feed the backbone hidden states + the *next* token ids
+                    // (shift +1), matching how the head is used during decode.
                     _ = model.mtpForward(
-                        y[1 ..< (n + 1)].expandedDimensions(axis: 0),
+                        hidden,
                         nextTokenIds: y[1 ..< (n + 1)].expandedDimensions(axis: 0),
                         cache: mtpCache.map { $0 as KVCache? })
-                    _ = hidden
                     eval(modelCache.map { $0.state }.flatMap { $0 }
                         + mtpCache.map { $0.state }.flatMap { $0 })
                     y = y[n...]

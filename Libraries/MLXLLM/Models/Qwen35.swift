@@ -680,7 +680,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
     @ModuleInfo(key: "mtp") var mtp: MTPModule?
 
-    public init(_ args: Qwen35TextConfiguration) {
+    /// When true, build the MTP head from config. The plain `qwen3_5` backbone passes false (its
+    /// checkpoint carries no MTP weights — the head is supplied separately by a drafter), while
+    /// embedded-MTP checkpoints (`qwen3_5_mtp`) pass true.
+    public init(_ args: Qwen35TextConfiguration, buildMTP: Bool = false) {
         self.configuration = args
         self.vocabularySize = args.vocabularySize
         self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
@@ -689,9 +692,17 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
-        if args.mtpNumHiddenLayers > 0 {
+        if buildMTP && args.mtpNumHiddenLayers > 0 {
             _mtp.wrappedValue = MTPModule(args)
         }
+    }
+
+    /// Build and attach an MTP head whose weights are supplied separately (draft-model style).
+    /// Shares this model's `embed_tokens` and `lm_head`. Returns the head's expected weight keys
+    /// (prefixed `mtp.`) so a caller can load a standalone drafter checkpoint into it.
+    public func attachMTPHead() {
+        guard mtp == nil, configuration.mtpNumHiddenLayers > 0 else { return }
+        _mtp.wrappedValue = MTPModule(configuration)
     }
 
     /// Apply the (now caller-side) final norm + lm_head to a pre-norm hidden state.
@@ -811,14 +822,16 @@ extension Qwen35TextModel: LoRAModel {
 
 // MARK: - Top-level Model
 
-public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider, MTPSpeculativeModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
-        let textModel = Qwen35TextModel(args.textConfig)
+        // The plain `qwen3_5` checkpoint carries no MTP weights (an MTP head, if used, is supplied
+        // separately by a drafter via `attachMTPHead()`), so don't build the head at load time.
+        let textModel = Qwen35TextModel(args.textConfig, buildMTP: false)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
@@ -851,6 +864,27 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
         return languageModel.sanitize(weights: sanitized)
     }
+
+    // MARK: MTPSpeculativeModel (draft-model style — head attached from a separate drafter)
+
+    public var hasMTP: Bool { languageModel.hasMTP }
+    public func makeMTPCache() -> [KVCache] { languageModel.makeMTPCache() }
+
+    /// Attach an MTP head (built from config) so a standalone drafter checkpoint can be loaded
+    /// into it, sharing this model's embeddings/lm_head.
+    public func attachMTPHead() { languageModel.attachMTPHead() }
+
+    public func backboneWithHidden(
+        _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int
+    ) -> (logits: MLXArray, hidden: MLXArray) {
+        languageModel.callAsFunctionWithHidden(inputs, cache: cache, nConfirmed: nConfirmed)
+    }
+
+    public func mtpForward(
+        _ hiddenStates: MLXArray, nextTokenIds: MLXArray, cache: [KVCache?]?
+    ) -> MLXArray {
+        languageModel.mtpForward(hiddenStates, nextTokenIds: nextTokenIds, cache: cache)
+    }
 }
 
 extension Qwen35Model: LoRAModel {
@@ -871,7 +905,8 @@ public class Qwen35MTPModel: Module, LLMModel, KVCacheDimensionProvider, MTPSpec
     @ModuleInfo(key: "language_model") var languageModel: Qwen35TextModel
 
     public init(_ args: Qwen35Configuration) {
-        let textModel = Qwen35TextModel(args.textConfig)
+        // Embedded-MTP checkpoint: the head's weights live in this same checkpoint.
+        let textModel = Qwen35TextModel(args.textConfig, buildMTP: true)
         self.vocabularySize = textModel.vocabularySize
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
@@ -908,6 +943,8 @@ public class Qwen35MTPModel: Module, LLMModel, KVCacheDimensionProvider, MTPSpec
     public var hasMTP: Bool { languageModel.hasMTP }
 
     public func makeMTPCache() -> [KVCache] { languageModel.makeMTPCache() }
+
+    public func attachMTPHead() { languageModel.attachMTPHead() }
 
     public func backboneWithHidden(
         _ inputs: MLXArray, cache: [KVCache]?, nConfirmed: Int

@@ -15,6 +15,11 @@ public protocol MTPSpeculativeModel: LanguageModel {
     /// Fresh KVCache list for the MTP layers (empty if no head).
     func makeMTPCache() -> [KVCache]
 
+    /// Attach an MTP head (built from config) whose weights will be supplied separately by a
+    /// standalone drafter checkpoint, sharing this model's embeddings/lm_head. No-op if the head
+    /// already exists or the config defines no MTP layers.
+    func attachMTPHead()
+
     /// Backbone forward returning logits AND the pre-norm hidden state.
     /// `nConfirmed` (> 0 and < sequence length) makes recurrent/SSM layers snapshot their state
     /// after the confirmed prefix so it can be rolled back if the draft token is rejected.
