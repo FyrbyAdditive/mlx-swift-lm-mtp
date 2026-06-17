@@ -237,36 +237,13 @@ final class Qwen35GatedDeltaNet: Module {
         cache: MambaCache? = nil,
         nConfirmed: Int = 0
     ) -> MLXArray {
-        let S = inputs.dim(1)
-
-        // MTP verify path: when 0 < nConfirmed < S, advance the recurrent state over the
-        // confirmed prefix, snapshot (conv, ssm) into the cache's rollbackState, then continue
-        // over the draft suffix. On rejection the loop restores from rollbackState.
-        if let cache, nConfirmed > 0, nConfirmed < S {
-            let confirmed = processChunk(
-                inputs[0..., 0 ..< nConfirmed],
-                mask: mask.map { $0[0..., 0 ..< nConfirmed] },
-                cache: cache)
-            cache.rollbackState = (cache[0], cache[1])
-            let draft = processChunk(
-                inputs[0..., nConfirmed ..< S],
-                mask: mask.map { $0[0..., nConfirmed ..< S] },
-                cache: cache)
-            return concatenated([confirmed, draft], axis: 1)
-        }
-
-        return processChunk(inputs, mask: mask, cache: cache)
-    }
-
-    /// Process a contiguous chunk, updating `cache` conv/ssm state in place.
-    private func processChunk(
-        _ inputs: MLXArray,
-        mask: MLXArray?,
-        cache: MambaCache?
-    ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
+        // Per-token projections + causal conv are position-independent, so run them ONCE over the
+        // full [confirmed, draft] sequence (not twice). Only the recurrent SSM scan is split, so
+        // the confirmed-prefix (conv, ssm) state can be snapshotted into rollbackState for rollback
+        // on draft rejection. On rejection the loop restores from rollbackState.
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
         let b = inProjB(inputs)
@@ -284,6 +261,12 @@ final class Qwen35GatedDeltaNet: Module {
         }
 
         let convInput = concatenated([convState, qkv], axis: 1)
+        let isVerifySplit = cache != nil && nConfirmed > 0 && nConfirmed < S
+        // Conv window ending at the last confirmed token (for rollback): convInput rows
+        // [nConfirmed .. nConfirmed+K-2] (convState is K-1 history rows prepended before token 0).
+        let confirmedConvState: MLXArray? =
+            isVerifySplit
+            ? convInput[0..., nConfirmed ..< (nConfirmed + convKernelSize - 1)] : nil
         if let cache {
             cache[0] = convInput[0..., (-(convKernelSize - 1))...]
         }
@@ -295,7 +278,6 @@ final class Qwen35GatedDeltaNet: Module {
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        var state = cache?[1]
         let dtype = q.dtype
         let invScale = pow(Float(headKDim), -0.5)
         let qNormed =
@@ -306,21 +288,29 @@ final class Qwen35GatedDeltaNet: Module {
             * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         var out: MLXArray
-
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
-
-        if let cache {
-            cache[1] = state
+        if isVerifySplit {
+            var state = cache?[1]
+            var outC: MLXArray
+            (outC, state) = gatedDeltaUpdate(
+                q: qNormed[0..., 0 ..< nConfirmed], k: kNormed[0..., 0 ..< nConfirmed],
+                v: v[0..., 0 ..< nConfirmed], a: a[0..., 0 ..< nConfirmed],
+                b: b[0..., 0 ..< nConfirmed], aLog: aLog, dtBias: dtBias, state: state,
+                mask: mask.map { $0[0..., 0 ..< nConfirmed] })
+            cache?.rollbackState = (confirmedConvState ?? cache?[0], state)
+            var outD: MLXArray
+            (outD, state) = gatedDeltaUpdate(
+                q: qNormed[0..., nConfirmed ..< S], k: kNormed[0..., nConfirmed ..< S],
+                v: v[0..., nConfirmed ..< S], a: a[0..., nConfirmed ..< S],
+                b: b[0..., nConfirmed ..< S], aLog: aLog, dtBias: dtBias, state: state,
+                mask: mask.map { $0[0..., nConfirmed ..< S] })
+            cache?[1] = state
+            out = concatenated([outC, outD], axis: 1)
+        } else {
+            var state = cache?[1]
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed, k: kNormed, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+                state: state, mask: mask)
+            cache?[1] = state
         }
 
         out = norm(out, gate: z)

@@ -162,13 +162,14 @@ public func mtpGenerate(
                     if draftTok == nil {
                         // No pending draft: backbone only, emit, then make the first draft.
                         let (toks, lps, _, hidden) = stepBackbone(y, nPredict: 1, nConfirmed: 0)
-                        eval(toks[0])
                         let mainTok = toks[0]
+                        let hiddenAtMain = hidden[0..., (hidden.dim(1) - 1)..., 0...]
+                        // Dispatch the MTP draft in the same graph as the backbone so both evaluate
+                        // together; `asyncEval` schedules without blocking the CPU.
+                        let d = stepMTP(hiddenLast: hiddenAtMain, mainTok: mainTok)
+                        asyncEval(mainTok, d.token)
                         emit(mainTok, lps[0])
                         if ntoks >= maxTokens { break }
-                        let hiddenAtMain = hidden[0..., (hidden.dim(1) - 1)..., 0...]
-                        let d = stepMTP(hiddenLast: hiddenAtMain, mainTok: mainTok)
-                        eval(d.token)
                         draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                         y = mainTok.reshaped(1).asType(.uint32)
                     } else {
@@ -199,14 +200,16 @@ public func mtpGenerate(
 
                         if accepted {
                             clearRollback()
+                            // Compute the next draft and schedule it (asyncEval) so its forward
+                            // overlaps the CPU-side detokenize/emit work below.
+                            let d = stepMTP(
+                                hiddenLast: hiddenAtDraft, mainTok: bonusTok,
+                                cacheCommit: (hiddenAtConfirmed, dtok))
+                            asyncEval(d.token)
                             emit(dtok, draftLp)
                             if ntoks >= maxTokens { break }
                             emit(bonusTok, bonusLp)
                             if ntoks >= maxTokens { break }
-                            let d = stepMTP(
-                                hiddenLast: hiddenAtDraft, mainTok: bonusTok,
-                                cacheCommit: (hiddenAtConfirmed, dtok))
-                            eval(d.token)
                             draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                             y = bonusTok.reshaped(1).asType(.uint32)
                         } else {
@@ -222,11 +225,12 @@ public func mtpGenerate(
                                 verifyId = categorical(
                                     MLX.log(dist).reshaped(1, -1)).item(Int.self)
                             }
+                            let vtok = MLXArray(UInt32(verifyId))
+                            // Schedule the next draft so it overlaps the emit below.
+                            let d = stepMTP(hiddenLast: hiddenAtConfirmed, mainTok: vtok)
+                            asyncEval(d.token)
                             emit(verifyPred.dtype == .uint32 ? MLXArray(UInt32(verifyId)) : MLXArray(verifyId), verifyLp)
                             if ntoks >= maxTokens { break }
-                            let vtok = MLXArray(UInt32(verifyId))
-                            let d = stepMTP(hiddenLast: hiddenAtConfirmed, mainTok: vtok)
-                            eval(d.token)
                             draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                             y = vtok.reshaped(1)
                         }
