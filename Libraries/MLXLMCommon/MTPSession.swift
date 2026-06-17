@@ -33,12 +33,12 @@ public final class MTPSession: @unchecked Sendable {
     private let promptCount: Int
     private let skipPrefill: Int
     private let snapshotAt: Int
+    /// Token granularity for block-aligned prefix-snapshot capture (configurable; default 512).
+    private let snapshotBlock: Int
     private let result: MTPCacheResult?
     private var prefillY: MLXArray
     private var prefillTotal: Int
     private var prefilled: Int
-    private var snapModel: [KVCache]? = nil
-    private var snapMtp: [KVCache]? = nil
     private let prefillStep: Int
     private let start = Date()
     private var prefillStart: Date? = nil
@@ -57,10 +57,13 @@ public final class MTPSession: @unchecked Sendable {
     /// A prefix snapshot captured during prefill, to be stored for cross-request reuse. Set once
     /// when prefill reaches `snapshotAt`; the scheduler takes it (clearing it) and inserts into the
     /// LRU. `(tokens, modelCache, mtpCache)`.
-    public private(set) var capturedSnapshot: (tokens: [Int32], model: [KVCache], mtp: [KVCache])?
+    /// Snapshots captured during prefill, awaiting insertion into the prefix LRU by the scheduler.
+    /// Prefill captures one at each block boundary (so cross-request reuse tracks the shared-prefix
+    /// boundary, not an arbitrary tail) plus the final tail; the scheduler drains this each step.
+    private var pendingSnapshots: [(tokens: [Int32], model: [KVCache], mtp: [KVCache])] = []
     public func takeCapturedSnapshot() -> (tokens: [Int32], model: [KVCache], mtp: [KVCache])? {
-        defer { capturedSnapshot = nil }
-        return capturedSnapshot
+        guard !pendingSnapshots.isEmpty else { return nil }
+        return pendingSnapshots.removeFirst()
     }
 
     public init(
@@ -72,6 +75,7 @@ public final class MTPSession: @unchecked Sendable {
         mtpCache: [KVCache],
         skipPrefill: Int,
         snapshotAt: Int,
+        snapshotBlock: Int = 512,
         stopTokenIds: Set<Int>,
         continuation: AsyncStream<Generation>.Continuation,
         result: MTPCacheResult?
@@ -90,6 +94,7 @@ public final class MTPSession: @unchecked Sendable {
         self.promptCount = promptTokens.dim(-1)
         self.skipPrefill = skipPrefill
         self.snapshotAt = snapshotAt
+        self.snapshotBlock = max(1, snapshotBlock)
         self.result = result
         self.detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
 
@@ -183,11 +188,22 @@ public final class MTPSession: @unchecked Sendable {
 
     /// Run ONE prefill chunk. Returns true while more prefill remains. Must be called inside the
     /// container. When prefill completes, transitions to `.decoding`.
+    ///
+    /// Captures a prefix snapshot at every `snapshotBlock`-aligned boundary it crosses (plus the
+    /// final tail at `snapshotAt`). Block-aligned boundaries mean a FUTURE request that shares only a
+    /// prefix of this prompt (e.g. the same system prompt, then different user text) can reuse the
+    /// largest block boundary ≤ the shared length — instead of missing because our single snapshot
+    /// landed at an arbitrary `promptLen−256` inside the divergent tail. Each snapshot is a complete
+    /// SSM checkpoint ending exactly at that boundary, so whole-prefix reuse stays exact.
     public func prefillStepOnce() -> Bool {
         if prefillStart == nil { prefillStart = Date() }
         guard prefillTotal > 1 else { finishPrefill(); return false }
         var n = min(prefillStep, prefillTotal - 1)
-        if snapshotAt > prefilled && snapshotAt < prefilled + n { n = snapshotAt - prefilled }
+        // Stop the chunk on the next capture boundary (block-aligned, or the tail snapshotAt) so the
+        // cache encodes exactly that many tokens when we snapshot.
+        if let next = nextCaptureBoundary(after: prefilled), next < prefilled + n {
+            n = next - prefilled
+        }
         let chunk = prefillY[0 ..< n]
         // Prefill only needs the cache warmed; the logits are discarded. Use prefillBackbone, which
         // skips the LM head (a wasted [1, chunk, vocab] matmul per chunk). MTP head also not warmed
@@ -195,7 +211,7 @@ public final class MTPSession: @unchecked Sendable {
         _ = model.prefillBackbone(chunk.expandedDimensions(axis: 0), cache: modelCache)
         // Quantize the full-attention layers' KV in place once past `quantizedKVStart` (no-op when
         // kvBits is nil; skips the GatedDeltaNet MambaCache layers). Shrinks the live cache AND the
-        // prefix snapshot taken below. QuantizedKVCache supports copy()/trim(), so snapshot reuse and
+        // prefix snapshots taken below. QuantizedKVCache supports copy()/trim(), so snapshot reuse and
         // MTP draft rollback still hold.
         maybeQuantizeKVCache(
             cache: &modelCache, kvBits: parameters.kvBits, kvGroupSize: parameters.kvGroupSize,
@@ -204,17 +220,37 @@ public final class MTPSession: @unchecked Sendable {
         prefillY = prefillY[n...]
         prefillTotal -= n
         prefilled += n
-        if snapshotAt > 0, prefilled == snapshotAt, snapModel == nil {
-            snapModel = modelCache.map { $0.copy() }
-            snapMtp = mtpCache.map { $0.copy() }
-            // Surface the snapshot so the scheduler can store it for reuse (taken once).
-            capturedSnapshot = (
-                Array(promptTokens.asArray(Int32.self).prefix(snapshotAt)),
-                snapModel!, snapMtp!)
+        // Capture at a block boundary or the tail snapshotAt (each captured once).
+        if shouldCapture(at: prefilled), !capturedAt.contains(prefilled) {
+            capturedAt.insert(prefilled)
+            pendingSnapshots.append((
+                Array(promptTokens.asArray(Int32.self).prefix(prefilled)),
+                modelCache.map { $0.copy() }, mtpCache.map { $0.copy() }))
         }
         if prefillTotal <= 1 { finishPrefill(); return false }
         return true
     }
+
+    /// The next token position at/after `pos` where we want to capture a snapshot: the next
+    /// block-aligned boundary, or the tail `snapshotAt`, whichever comes first (and is a valid
+    /// capture point). Returns nil if none remain before the prompt end.
+    private func nextCaptureBoundary(after pos: Int) -> Int? {
+        var cands: [Int] = []
+        let nextBlock = ((pos / snapshotBlock) + 1) * snapshotBlock
+        if nextBlock < promptCount { cands.append(nextBlock) }
+        if snapshotAt > pos, snapshotAt < promptCount { cands.append(snapshotAt) }
+        return cands.min()
+    }
+
+    /// Capture at a position iff it's a block boundary (≥ minReuse, < promptCount) or the tail
+    /// snapshotAt. Leaves a non-empty suffix so the snapshot is strictly shorter than any prompt
+    /// that shares it (reuseCount requires that).
+    private func shouldCapture(at pos: Int) -> Bool {
+        guard pos < promptCount, pos >= 16 else { return false }
+        return pos == snapshotAt || pos % snapshotBlock == 0
+    }
+
+    private var capturedAt: Set<Int> = []
 
     private func finishPrefill() {
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
@@ -308,14 +344,9 @@ public final class MTPSession: @unchecked Sendable {
         guard phase != .finished else { return }
         phase = .finished
         if let tail = detokenizer.next(), !tail.isEmpty { continuation.yield(.chunk(tail)) }
-        if let result {
-            result.promptTokens = promptTokens.asArray(Int32.self)
-            if let snapModel, let snapMtp, snapshotAt > 0 {
-                result.snapshotModelCache = snapModel
-                result.snapshotMtpCache = snapMtp
-                result.snapshotTokens = Array(promptTokens.asArray(Int32.self).prefix(snapshotAt))
-            }
-        }
+        // Prefix snapshots are surfaced via `pendingSnapshots`/`takeCapturedSnapshot` and inserted
+        // into the LRU by the scheduler — not via `result`. `result` carries only timing/prompt info.
+        result?.promptTokens = promptTokens.asArray(Int32.self)
         let elapsed = Date().timeIntervalSince(start)
         let info = GenerateCompletionInfo(
             promptTokenCount: promptCount, generationTokenCount: ntoks,
