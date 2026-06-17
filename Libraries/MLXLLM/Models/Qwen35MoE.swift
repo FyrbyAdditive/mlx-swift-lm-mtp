@@ -21,6 +21,10 @@ public struct Qwen35Configuration: Codable, Sendable {
         case textConfig = "text_config"
     }
 
+    private enum ExtraKeys: String, CodingKey {
+        case mtpNumHiddenLayers = "mtp_num_hidden_layers"
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.modelType = try container.decode(String.self, forKey: .modelType)
@@ -31,6 +35,13 @@ public struct Qwen35Configuration: Codable, Sendable {
             self.textConfig = textConfig
         } else {
             self.textConfig = try Qwen35TextConfiguration(from: decoder)
+        }
+
+        // `mtp_num_hidden_layers` lives at the top level of MTP checkpoints (alongside
+        // `text_config`); propagate it into the text config so the model builds the MTP head.
+        let extra = try decoder.container(keyedBy: ExtraKeys.self)
+        if let mtpLayers = try extra.decodeIfPresent(Int.self, forKey: .mtpNumHiddenLayers) {
+            self.textConfig.mtpNumHiddenLayers = mtpLayers
         }
     }
 }

@@ -1211,6 +1211,11 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+    /// Snapshot of (conv, ssm) state taken *after* the confirmed token and *before* the
+    /// draft token during MTP speculative decoding (see `n_confirmed`). Restored on rejection.
+    /// `nil` when no draft is pending. Not part of the serialized cache state.
+    public var rollbackState: (MLXArray?, MLXArray?)?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
