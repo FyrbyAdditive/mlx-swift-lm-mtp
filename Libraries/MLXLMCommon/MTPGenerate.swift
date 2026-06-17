@@ -17,7 +17,20 @@ import MLX
 public func mtpGenerate(
     input: LMInput,
     parameters: GenerateParameters,
-    context: ModelContext
+    context: ModelContext,
+    // Restore a previously-taken prefix snapshot (copies of model+MTP caches that encode exactly
+    // `restoreCount` leading prompt tokens). When set, prefill skips those tokens.
+    restore: (model: [KVCache], mtp: [KVCache])? = nil,
+    restoreCount: Int = 0,
+    // If > 0, take a `.copy()` snapshot of both caches once exactly `snapshotAt` tokens have been
+    // prefilled, and report it via `result.snapshot*`/`result.snapshotTokens` on clean completion.
+    // Lets a future request whose prompt shares that prefix restore it and skip re-prefilling.
+    snapshotAt: Int = 0,
+    // Filled once, only on clean completion. Carries the prompt tokens (for the next snapshot-point
+    // decision) and, if `snapshotAt > 0`, the snapshot caches + the tokens they encode. Left empty
+    // on cancellation/error. A reference box (not a closure) so the non-Sendable caches never cross
+    // the Task boundary as `sending` values.
+    result: MTPCacheResult? = nil
 ) throws -> AsyncStream<Generation> {
     guard (context.model as? any MTPSpeculativeModel)?.hasMTP == true else {
         throw MTPError.notSupported
@@ -32,10 +45,12 @@ public func mtpGenerate(
     // sending checks; everything is consumed once inside the (serialized) generation task.
     let boxedInput = SendableBox(input)
     let boxedContext = SendableBox(context)
+    let boxedRestore = SendableBox(restore)
 
     let task = Task {
         let context = boxedContext.consume()
         let input = boxedInput.consume()
+        let restore = boxedRestore.consume()
         // safe: guarded above
         let model = context.model as! any MTPSpeculativeModel
         // The processor yields batched tokens (shape [1, seqLen]); flatten to a 1-D [seqLen]
@@ -44,8 +59,20 @@ public func mtpGenerate(
         let start = Date()
         let promptCount = promptTokens.dim(-1)
 
-        let modelCache = context.model.newCache(parameters: parameters)
-        let mtpCache = model.makeMTPCache()
+        // Restore a prefix snapshot (its caches encode exactly `restoreCount` leading prompt
+        // tokens) or build fresh. We work on COPIES of the restored caches so the stored snapshot
+        // stays immutable and reusable for later requests. With a restore, prefill skips the first
+        // `restoreCount` tokens — this is what avoids re-prefilling a constant system prompt.
+        let modelCache: [KVCache]
+        let mtpCache: [KVCache]
+        if let restore {
+            modelCache = restore.model.map { $0.copy() }
+            mtpCache = restore.mtp.map { $0.copy() }
+        } else {
+            modelCache = context.model.newCache(parameters: parameters)
+            mtpCache = model.makeMTPCache()
+        }
+        let skipPrefill = restore != nil ? max(0, restoreCount) : 0
 
         // Stop-token set: model EOS ids + tokenizer EOS + any extra EOS strings (e.g. <|im_end|>).
         // Without this the loop runs to maxTokens, sailing past <|im_end|>/<|endoftext|> and making
@@ -127,13 +154,25 @@ public func mtpGenerate(
                 }
             }
 
+            // Snapshot of the caches taken mid-prefill at `snapshotAt` tokens (for future reuse).
+            var snapModel: [KVCache]? = nil
+            var snapMtp: [KVCache]? = nil
+
             // --- Prefill: process all but the last prompt token, warming both caches. ---
+            // When restoring, the leading `skipPrefill` tokens are already encoded, so drop them and
+            // prefill only the new suffix. `prefilled` tracks the absolute position in the prompt
+            // (counting restored tokens) so we can snapshot exactly at `snapshotAt`.
             do {
-                var y = promptTokens
+                var y = skipPrefill > 0 ? promptTokens[skipPrefill...] : promptTokens
                 var total = y.dim(-1)
+                var prefilled = skipPrefill
                 let prefillStep = parameters.prefillStepSize
                 while total > 1 {
-                    let n = min(prefillStep, total - 1)
+                    // Cap the chunk so we land exactly on `snapshotAt` when one is requested ahead.
+                    var n = min(prefillStep, total - 1)
+                    if snapshotAt > prefilled && snapshotAt < prefilled + n {
+                        n = snapshotAt - prefilled
+                    }
                     let chunk = y[0 ..< n]
                     let (_, hidden) = model.backboneWithHidden(
                         chunk.expandedDimensions(axis: 0), cache: modelCache, nConfirmed: 0)
@@ -147,6 +186,12 @@ public func mtpGenerate(
                         + mtpCache.map { $0.state }.flatMap { $0 })
                     y = y[n...]
                     total -= n
+                    prefilled += n
+                    // Take the snapshot the moment the caches encode exactly `snapshotAt` tokens.
+                    if snapshotAt > 0, prefilled == snapshotAt, snapModel == nil {
+                        snapModel = modelCache.map { $0.copy() }
+                        snapMtp = mtpCache.map { $0.copy() }
+                    }
                 }
 
                 var ntoks = 0
@@ -260,6 +305,20 @@ public func mtpGenerate(
                 // Flush any buffered detokenizer text.
                 if let tail = detokenizer.next(), !tail.isEmpty {
                     continuation.yield(.chunk(tail))
+                }
+
+                // Report caches + the exact token sequence they encode for whole-prefix reuse on
+                // the next request — but ONLY on a clean finish. If the run was cancelled mid-stream
+                // the caches are in an indeterminate state, so we skip reporting and the engine will
+                // discard them (rebuild next time). (Pure derivation; see committedSequence.)
+                if !Task.isCancelled, let result {
+                    result.promptTokens = promptTokens.asArray(Int32.self)
+                    if let snapModel, let snapMtp, snapshotAt > 0 {
+                        result.snapshotModelCache = snapModel
+                        result.snapshotMtpCache = snapMtp
+                        result.snapshotTokens = Array(
+                            promptTokens.asArray(Int32.self).prefix(snapshotAt))
+                    }
                 }
 
                 // Completion info.
