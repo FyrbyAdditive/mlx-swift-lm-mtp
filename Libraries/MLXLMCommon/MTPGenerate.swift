@@ -162,6 +162,7 @@ public func mtpGenerate(
             // When restoring, the leading `skipPrefill` tokens are already encoded, so drop them and
             // prefill only the new suffix. `prefilled` tracks the absolute position in the prompt
             // (counting restored tokens) so we can snapshot exactly at `snapshotAt`.
+            let prefillStart = Date()  // DIAGNOSTIC: time the prefill loop only
             do {
                 var y = skipPrefill > 0 ? promptTokens[skipPrefill...] : promptTokens
                 var total = y.dim(-1)
@@ -174,16 +175,15 @@ public func mtpGenerate(
                         n = snapshotAt - prefilled
                     }
                     let chunk = y[0 ..< n]
-                    let (_, hidden) = model.backboneWithHidden(
+                    let (_, _) = model.backboneWithHidden(
                         chunk.expandedDimensions(axis: 0), cache: modelCache, nConfirmed: 0)
-                    // Warm the MTP cache: feed the backbone hidden states + the *next* token ids
-                    // (shift +1), matching how the head is used during decode.
-                    _ = model.mtpForward(
-                        hidden,
-                        nextTokenIds: y[1 ..< (n + 1)].expandedDimensions(axis: 0),
-                        cache: mtpCache.map { $0 as KVCache? })
-                    eval(modelCache.map { $0.state }.flatMap { $0 }
-                        + mtpCache.map { $0.state }.flatMap { $0 })
+                    // NOTE: the MTP head is intentionally NOT warmed during prefill. It was being run
+                    // over every prefill chunk and the result discarded — pure waste (the MTP cache is
+                    // full-attention, no SSM). The MTP head only affects DRAFT proposals (acceptance
+                    // rate), never emitted tokens (those come from the backbone and are verified), so a
+                    // cold MTP cache at decode start is correct and self-warms within O(1) steps. This
+                    // removes ~1/9 of the full-attention work from the (expensive) cold prefill.
+                    eval(modelCache.map { $0.state }.flatMap { $0 })
                     y = y[n...]
                     total -= n
                     prefilled += n
@@ -193,6 +193,7 @@ public func mtpGenerate(
                         snapMtp = mtpCache.map { $0.copy() }
                     }
                 }
+                result?.prefillSeconds = Date().timeIntervalSince(prefillStart)  // DIAGNOSTIC
 
                 var ntoks = 0
                 var stopped = false

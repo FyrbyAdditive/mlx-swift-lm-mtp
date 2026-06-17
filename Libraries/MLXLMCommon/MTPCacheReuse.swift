@@ -17,6 +17,9 @@ public final class MTPCacheResult: @unchecked Sendable {
     public var snapshotMtpCache: [KVCache]?
     /// The exact token prefix the snapshot caches encode.
     public var snapshotTokens: [Int32]?
+    /// DIAGNOSTIC: wall-clock seconds spent in the prefill loop (excludes decode), set on clean
+    /// completion. Lets the engine separate real prefill compute from copy/scheduling/contention.
+    public var prefillSeconds: Double?
     public init() {}
 }
 
