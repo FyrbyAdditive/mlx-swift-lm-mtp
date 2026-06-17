@@ -47,6 +47,15 @@ public func mtpGenerate(
         let modelCache = context.model.newCache(parameters: parameters)
         let mtpCache = model.makeMTPCache()
 
+        // Stop-token set: model EOS ids + tokenizer EOS + any extra EOS strings (e.g. <|im_end|>).
+        // Without this the loop runs to maxTokens, sailing past <|im_end|>/<|endoftext|> and making
+        // the model role-play both sides of the chat (the "infinite waffle").
+        let stopTokenIds = MTPStopTokens.build(
+            eosTokenIds: context.configuration.eosTokenIds,
+            tokenizerEOSTokenId: context.tokenizer.eosTokenId,
+            extraEOSTokens: context.configuration.extraEOSTokens,
+            tokenToId: { context.tokenizer.convertTokenToId($0) })
+
             // Sample a token + return the acceptance log-probs that produced it.
             // `lpAccept` is the temperature-adjusted, normalized log-prob distribution used by
             // the acceptance test and residual sampling; `logprobs` is the raw (unscaled) dist.
@@ -141,22 +150,33 @@ public func mtpGenerate(
                 }
 
                 var ntoks = 0
+                var stopped = false
                 var draftTok: MLXArray? = nil
                 var draftLp = MLXArray(0)
                 var draftAccept = MLXArray(0)
                 var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
 
-                func emit(_ tokenArray: MLXArray, _ lp: MLXArray) {
+                /// Emit a token's text. Returns true if it was a stop token (EOS): the caller must
+                /// stop and the stop token is NOT detokenized/yielded (matches the standard loop's
+                /// includeStopToken:false default).
+                @discardableResult
+                func emit(_ tokenArray: MLXArray, _ lp: MLXArray) -> Bool {
                     let id = tokenArray.item(Int.self)
+                    if stopTokenIds.contains(id) {
+                        stopped = true
+                        return true
+                    }
                     detokenizer.append(token: id)
                     if let chunk = detokenizer.next() {
                         continuation.yield(.chunk(chunk))
                     }
                     _ = lp
                     ntoks += 1
+                    return false
                 }
 
                 while ntoks < maxTokens {
+                    if stopped { break }
                     if Task.isCancelled { break }
 
                     if draftTok == nil {
@@ -168,7 +188,7 @@ public func mtpGenerate(
                         // together; `asyncEval` schedules without blocking the CPU.
                         let d = stepMTP(hiddenLast: hiddenAtMain, mainTok: mainTok)
                         asyncEval(mainTok, d.token)
-                        emit(mainTok, lps[0])
+                        if emit(mainTok, lps[0]) { break }
                         if ntoks >= maxTokens { break }
                         draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                         y = mainTok.reshaped(1).asType(.uint32)
@@ -206,9 +226,9 @@ public func mtpGenerate(
                                 hiddenLast: hiddenAtDraft, mainTok: bonusTok,
                                 cacheCommit: (hiddenAtConfirmed, dtok))
                             asyncEval(d.token)
-                            emit(dtok, draftLp)
+                            if emit(dtok, draftLp) { break }
                             if ntoks >= maxTokens { break }
-                            emit(bonusTok, bonusLp)
+                            if emit(bonusTok, bonusLp) { break }
                             if ntoks >= maxTokens { break }
                             draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                             y = bonusTok.reshaped(1).asType(.uint32)
@@ -229,7 +249,7 @@ public func mtpGenerate(
                             // Schedule the next draft so it overlaps the emit below.
                             let d = stepMTP(hiddenLast: hiddenAtConfirmed, mainTok: vtok)
                             asyncEval(d.token)
-                            emit(verifyPred.dtype == .uint32 ? MLXArray(UInt32(verifyId)) : MLXArray(verifyId), verifyLp)
+                            if emit(verifyPred.dtype == .uint32 ? MLXArray(UInt32(verifyId)) : MLXArray(verifyId), verifyLp) { break }
                             if ntoks >= maxTokens { break }
                             draftTok = d.token; draftLp = d.logprobs; draftAccept = d.accept
                             y = vtok.reshaped(1)
@@ -249,7 +269,7 @@ public func mtpGenerate(
                     generationTokenCount: ntoks,
                     promptTime: 0,
                     generationTime: elapsed,
-                    stopReason: ntoks >= maxTokens ? .length : .stop)
+                    stopReason: (!stopped && ntoks >= maxTokens) ? .length : .stop)
                 continuation.yield(.info(info))
                 continuation.finish()
             } catch {
