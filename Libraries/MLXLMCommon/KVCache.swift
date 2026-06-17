@@ -178,7 +178,12 @@ public func createCausalMask(
     n: Int,
     offset: Int,
     windowSize: Int? = nil,
-    lengths: MLXArray? = nil
+    lengths: MLXArray? = nil,
+    // Per-sequence `(B,)` padding arrays for batched (left-padded) caches. `leftPadding[b]` is the
+    // number of pad positions at the front of row b (so real tokens start there); `rightPadding[b]`
+    // is trailing pad during a padded prefill. Mirrors mlx-lm's create_causal_mask.
+    leftPadding: MLXArray? = nil,
+    rightPadding: MLXArray? = nil
 ) -> MLXArray {
     var rinds = MLXArray(Int32(0) ..< Int32(offset + n))
     var linds = offset != 0 ? MLXArray(Int32(offset) ..< Int32(offset + n)) : rinds
@@ -193,6 +198,18 @@ public func createCausalMask(
     if var lengths {
         lengths = lengths[0..., .newAxis, .newAxis, .newAxis]
         mask = mask & (rinds .< lengths)
+    }
+
+    // Right padding: block padded tail positions (rinds < (offset+N) - right_padding[b]).
+    if let rightPadding {
+        let bound = expandedDimensions(MLXArray(Int32(offset + n)) - rightPadding, axes: [1, 2, 3])
+        mask = mask & (rinds .< bound)
+    }
+
+    // Left padding: block padded front positions (left_padding[b] <= rinds).
+    if let leftPadding {
+        let lp = expandedDimensions(leftPadding, axes: [1, 2, 3])
+        mask = mask & (lp .<= rinds)
     }
 
     return mask
@@ -438,6 +455,242 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public var debugDescription: String {
         "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
+    }
+}
+
+/// Roll each row of `x` along `axis` by a per-row shift (shape `(B,)`). Port of mlx-lm's
+/// `dynamic_roll`, used to right-justify a padded-prefill batch (move trailing pad to the front).
+func dynamicRoll(_ x: MLXArray, shifts: MLXArray, axis: Int) -> MLXArray {
+    let n = x.dim(axis)
+    // Build an index grid `(arange(n) - shift) % n` broadcast over the batch dimension, then
+    // gather along `axis`. `shifts` is `(B,)`; expand it to broadcast against the rolled axis.
+    var idx = MLXArray(Int32(0) ..< Int32(n))[.newAxis]  // (1, n)
+    let shiftCol = shifts.reshaped([shifts.dim(0), 1])    // (B, 1)
+    idx = ((idx - shiftCol) % n + n) % n                  // (B, n), nonnegative modulo
+    // Expand idx to x.ndim, placing the n-axis at `axis` and batch at 0.
+    var shaped = [Int](repeating: 1, count: x.ndim)
+    shaped[0] = x.dim(0)
+    shaped[axis] = n
+    let gather = idx.reshaped(shaped)
+    return takeAlong(x, gather, axis: axis)
+}
+
+/// Batched KV cache for the full-attention layers when serving multiple sequences at once
+/// (continuous batching). Port of mlx-lm's `BatchKVCache`.
+///
+/// Inputs are **left-padded**: all rows share one `(B, heads, paddedSeq, dim)` buffer, but each
+/// sequence's real content starts after its own `leftPadding[b]`. The scalar `bufferIndex`
+/// (`_idx` in mlx-lm) is the shared filled length of that buffer; `seqOffset` and `leftPadding`
+/// are per-sequence `(B,)` arrays driving the causal mask and RoPE positions so each row is
+/// positioned by its own real length, not the padded length.
+public final class BatchKVCache: BaseKVCache, BatchPositionedKVCache, @unchecked Sendable {
+    public var step = 256
+
+    /// Per-sequence RoPE offset `(B,)` — the position the NEXT token occupies for each row.
+    /// `applyRotaryPosition` uses this so each left-padded row rotates by its own real length.
+    public var batchOffset: MLXArray { seqOffset }
+    private var keys: MLXArray?
+    private var values: MLXArray?
+    /// Per-sequence cache position `(B,)` (mlx-lm `offset`). Starts at `-leftPadding[b]`.
+    public private(set) var seqOffset: MLXArray
+    /// Per-sequence left padding `(B,)` (mlx-lm `left_padding`).
+    public private(set) var leftPadding: MLXArray
+    /// Shared filled length of the buffer (mlx-lm `_idx`).
+    private var bufferIndex = 0
+    private var rightPadding: MLXArray?
+
+    public init(leftPadding: [Int]) {
+        self.leftPadding = MLXArray(leftPadding.map { Int32($0) })
+        self.seqOffset = MLXArray(leftPadding.map { Int32(-$0) })
+        super.init()
+    }
+
+    /// The protocol's scalar `offset` is the shared buffer fill index (used for trim/length math).
+    public override var offset: Int {
+        get { bufferIndex }
+        set { bufferIndex = newValue }
+    }
+
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let prev = bufferIndex
+        let needGrow = self.keys == nil || (prev + keys.dim(2)) > self.keys!.dim(2)
+        if needGrow {
+            let B = keys.dim(0)
+            let kvHeads = keys.dim(1)
+            let kHeadDim = keys.dim(3)
+            let vHeadDim = values.dim(3)
+            let nSteps = (step + keys.dim(2) - 1) / step
+            let newK = MLXArray.zeros([B, kvHeads, nSteps * step, kHeadDim], dtype: keys.dtype)
+            let newV = MLXArray.zeros([B, kvHeads, nSteps * step, vHeadDim], dtype: values.dtype)
+            if var ck = self.keys, var cv = self.values {
+                if prev % step != 0 {
+                    ck = ck[.ellipsis, ..<prev, 0...]
+                    cv = cv[.ellipsis, ..<prev, 0...]
+                }
+                self.keys = concatenated([ck, newK], axis: 2)
+                self.values = concatenated([cv, newV], axis: 2)
+            } else {
+                self.keys = newK
+                self.values = newV
+            }
+        }
+
+        seqOffset = seqOffset + keys.dim(2)
+        bufferIndex += keys.dim(2)
+        self.keys?[.ellipsis, prev ..< bufferIndex, 0...] = keys
+        self.values?[.ellipsis, prev ..< bufferIndex, 0...] = values
+        return (
+            self.keys![.ellipsis, ..<bufferIndex, 0...],
+            self.values![.ellipsis, ..<bufferIndex, 0...]
+        )
+    }
+
+    /// Register padding before prefill. `leftPadding` may only be set on an empty cache.
+    /// `rightPadding` (with `lengths`) defers a right-justification applied in `finalize()`.
+    public func prepare(leftPadding: [Int]? = nil, lengths: [Int]? = nil, rightPadding: [Int]? = nil)
+    {
+        if let leftPadding {
+            precondition(keys == nil, "left padding can only be added to an empty BatchKVCache")
+            let lp = MLXArray(leftPadding.map { Int32($0) })
+            self.leftPadding = self.leftPadding + lp
+            self.seqOffset = self.seqOffset - lp
+        }
+        if let rightPadding, rightPadding.max() ?? 0 > 0 {
+            self.rightPadding = MLXArray(rightPadding.map { Int32($0) })
+        }
+    }
+
+    /// Apply deferred right-padding by rolling each row's trailing pad to the front, so the buffer
+    /// becomes left-padded for the decode phase. Call once after the padded prefill.
+    public func finalize() {
+        guard let padding = rightPadding, let k = keys, let v = values else { return }
+        keys = dynamicRoll(k, shifts: padding, axis: 2)
+        values = dynamicRoll(v, shifts: padding, axis: 2)
+        seqOffset = seqOffset - padding
+        leftPadding = leftPadding + padding
+        rightPadding = nil
+    }
+
+    /// Causal mask honoring per-sequence left padding; offset is the shared buffer index.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        .array(
+            createCausalMask(
+                n: n, offset: bufferIndex, windowSize: windowSize, leftPadding: leftPadding))
+    }
+
+    /// Keep only the given rows (drop finished sequences), then shrink shared left padding.
+    public func filter(batchIndices: MLXArray) {
+        if let k = keys, let v = values {
+            keys = k[batchIndices]
+            values = v[batchIndices]
+        }
+        seqOffset = seqOffset[batchIndices]
+        leftPadding = leftPadding[batchIndices]
+        let minLeftPad = leftPadding.min().item(Int.self)
+        if minLeftPad > 0 {
+            if let k = keys, let v = values {
+                keys = k[.ellipsis, minLeftPad..., 0...]
+                values = v[.ellipsis, minLeftPad..., 0...]
+            }
+            bufferIndex -= minLeftPad
+            leftPadding = leftPadding - minLeftPad
+        }
+    }
+
+    /// Append `other`'s rows to this cache (mid-flight admission), right-justifying both buffers to
+    /// the shared index so positions stay aligned. Port of mlx-lm `BatchKVCache.extend`.
+    public func extend(_ other: BatchKVCache) {
+        if keys == nil && other.keys == nil {
+            leftPadding = concatenated([leftPadding, other.leftPadding])
+            seqOffset = concatenated([seqOffset, other.seqOffset])
+            return
+        }
+        let maxIdx = max(bufferIndex, other.bufferIndex)
+        var H = 0, D = 0, M = 0
+        var L1 = 0, L2 = 0
+        if let k = keys { H = k.dim(1); L1 = k.dim(2); D = k.dim(3); M = values!.dim(3) }
+        if let k = other.keys { H = k.dim(1); L2 = k.dim(2); D = k.dim(3); M = other.values!.dim(3) }
+        let maxSize = max(L1, L2)
+
+        func pad(_ c: BatchKVCache) -> (MLXArray, MLXArray, MLXArray, MLXArray) {
+            var k = c.keys
+            var v = c.values
+            let B = c.seqOffset.dim(0)
+            if k == nil {
+                k = MLXArray.zeros([B, H, 0, D], dtype: keys?.dtype ?? .float32)
+                v = MLXArray.zeros([B, H, 0, M], dtype: values?.dtype ?? .float32)
+            }
+            let left = maxIdx - c.bufferIndex
+            var right = maxSize - k!.dim(2) - left
+            if right < 0 {
+                k = k![.ellipsis, ..<(k!.dim(2) + right), 0...]
+                v = v![.ellipsis, ..<(v!.dim(2) + right), 0...]
+                right = 0
+            }
+            if left != 0 || right != 0 {
+                let widths: [IntOrPair] = [
+                    IntOrPair((0, 0)), IntOrPair((0, 0)), IntOrPair((left, right)), IntOrPair((0, 0)),
+                ]
+                k = padded(k!, widths: widths)
+                v = padded(v!, widths: widths)
+            }
+            return (k!, v!, c.seqOffset, c.leftPadding + left)
+        }
+
+        let (k1, v1, o1, lp1) = pad(self)
+        let (k2, v2, o2, lp2) = pad(other)
+        keys = concatenated([k1, k2], axis: 0)
+        values = concatenated([v1, v2], axis: 0)
+        seqOffset = concatenated([o1, o2])
+        leftPadding = concatenated([lp1, lp2])
+        bufferIndex = maxIdx
+    }
+
+    public override var isTrimmable: Bool { true }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = min(bufferIndex, n)
+        bufferIndex -= trimmed
+        seqOffset = seqOffset - trimmed
+        return trimmed
+    }
+
+    public override var state: [MLXArray] {
+        get {
+            guard var k = keys, var v = values else { return [seqOffset, leftPadding] }
+            if bufferIndex < k.dim(2) {
+                k = k[.ellipsis, ..<bufferIndex, 0...]
+                v = v[.ellipsis, ..<bufferIndex, 0...]
+            }
+            return [k, v, seqOffset, leftPadding]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("BatchKVCache state must be [keys, values, seqOffset, leftPadding]")
+            }
+            keys = newValue[0]
+            values = newValue[1]
+            seqOffset = newValue[2]
+            leftPadding = newValue[3]
+            bufferIndex = keys!.dim(2)
+        }
+    }
+
+    public override func copy() -> any KVCache {
+        let new = BatchKVCache(leftPadding: [])
+        new.step = step
+        new.seqOffset = seqOffset[.ellipsis]
+        new.leftPadding = leftPadding[.ellipsis]
+        new.bufferIndex = bufferIndex
+        new.rightPadding = rightPadding.map { $0[.ellipsis] }
+        if let k = keys, let v = values {
+            new.keys = k[.ellipsis]
+            new.values = v[.ellipsis]
+        }
+        return new
     }
 }
 

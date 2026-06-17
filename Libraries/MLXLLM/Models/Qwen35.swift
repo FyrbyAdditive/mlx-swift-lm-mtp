@@ -660,7 +660,7 @@ public class MTPModule: Module {
     }
 }
 
-public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
+public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider, BatchableModel {
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
@@ -709,6 +709,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return project(hidden)
     }
 
+    // MARK: BatchableModel (continuous batching). `newBatchCache` is defined above; the batched
+    // forward is just the standard forward — the model already builds per-sequence masks from the
+    // batched caches' offsets/leftPadding.
+    public func batchForward(_ tokens: MLXArray, cache: [KVCache]) -> MLXArray {
+        callAsFunction(tokens, cache: cache)
+    }
+
     /// Backbone forward returning both logits and the **pre-norm** hidden state, with optional
     /// `nConfirmed` SSM snapshotting for MTP verify. Used by the MTP decode loop.
     public func callAsFunctionWithHidden(
@@ -749,6 +756,18 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return MambaCache()
             }
             return KVCacheSimple()
+        }
+    }
+
+    /// Build per-layer caches for a left-padded BATCH of `leftPadding.count` sequences: batched
+    /// `MambaCache` for GatedDeltaNet (linear) layers, `BatchKVCache` for full-attention layers.
+    /// Used by the continuous-batching engine; the recurrent (Mamba/conv) state carries the batch
+    /// dim, and the attention cache tracks per-sequence offsets.
+    public func newBatchCache(leftPadding: [Int]) -> [KVCache] {
+        return model.layers.map { layer in
+            layer.isLinear
+                ? MambaCache(leftPadding: leftPadding)
+                : BatchKVCache(leftPadding: leftPadding)
         }
     }
 

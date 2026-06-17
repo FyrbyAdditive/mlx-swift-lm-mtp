@@ -1313,12 +1313,22 @@ enum Qwen35Language {
                 return KVCacheSimple()
             }
         }
+
+        /// Per-layer caches for a left-padded BATCH of `leftPadding.count` sequences (continuous
+        /// batching): batched `MambaCache` for GatedDeltaNet layers, `BatchKVCache` for attention.
+        func newBatchCache(leftPadding: [Int]) -> [KVCache] {
+            model.layers.map { layer in
+                layer.isLinear
+                    ? MambaCache(leftPadding: leftPadding)
+                    : BatchKVCache(leftPadding: leftPadding)
+            }
+        }
     }
 }
 
 // MARK: - Model
 
-public class Qwen35: Module, VLMModel {
+public class Qwen35: Module, VLMModel, BatchableModel {
     @ModuleInfo(key: "vision_tower") private var visionModel: Qwen3VLVision.VisionModel
     @ModuleInfo(key: "language_model") fileprivate var languageModel: Qwen35Language.LanguageModel
 
@@ -1475,6 +1485,36 @@ public class Qwen35: Module, VLMModel {
             imageGridTHW: nil,
             videoGridTHW: nil
         )
+        return result.logits
+    }
+
+    // MARK: BatchableModel (continuous batching, text-only path)
+
+    public func newBatchCache(leftPadding: [Int]) -> [KVCache] {
+        languageModel.newBatchCache(leftPadding: leftPadding)
+    }
+
+    public func batchForward(_ tokens: MLXArray, cache: [KVCache]) -> MLXArray {
+        // Per-row text positionIds for mRoPE: each row's position starts at its own cache offset
+        // (seqOffset, which encodes -leftPadding so real tokens begin at position 0). Shape the
+        // VLM expects is (3, B, S) — the three mRoPE sections are identical for text-only input.
+        let B = tokens.dim(0)
+        let S = tokens.dim(1)
+        let baseOffset: MLXArray
+        if let bk = cache.first(where: { $0 is BatchKVCache }) as? BatchKVCache {
+            baseOffset = bk.seqOffset  // (B,)
+        } else {
+            baseOffset = MLXArray.zeros([B], dtype: .int32)
+        }
+        // positions[b, s] = seqOffset[b] + s
+        let arange = MLXArray(Int32(0) ..< Int32(S))[.newAxis, 0...]  // (1, S)
+        let positions2D = baseOffset[0..., .newAxis] + arange          // (B, S)
+        let positionIds = tiled(positions2D[.newAxis, 0..., 0...], repetitions: [3, 1, 1])  // (3,B,S)
+
+        let typedCache = castCacheOptional(cache)
+        let result = languageModel(
+            tokens, inputsEmbeds: nil, cache: typedCache, mask: nil,
+            positionIds: positionIds, pixelValues: nil, imageGridTHW: nil, videoGridTHW: nil)
         return result.logits
     }
 
