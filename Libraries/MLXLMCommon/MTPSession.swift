@@ -124,11 +124,20 @@ public final class MTPSession: @unchecked Sendable {
         return (token, logprobs, lpAccept)
     }
 
+    // DECODE DIAGNOSTIC (gated by MLXZ_DECODE_DIAG=1): per-phase wall-time accumulators + step count.
+    static let decodeDiag = ProcessInfo.processInfo.environment["MLXZ_DECODE_DIAG"] == "1"
+    private var diagBackboneS = 0.0
+    private var diagMTPS = 0.0
+    private var diagStepWallS = 0.0
+    private var diagSteps = 0
+
     private func stepBackbone(_ y: MLXArray, nPredict: Int, nConfirmed: Int)
         -> (toks: [MLXArray], lps: [MLXArray], accept: [MLXArray], hidden: MLXArray)
     {
+        let t0 = Self.decodeDiag ? Date() : nil
         let (logitsAll, hidden) = model.backboneWithHidden(
             y.expandedDimensions(axis: 0), cache: modelCache, nConfirmed: nConfirmed)
+        if let t0 { eval(logitsAll, hidden); diagBackboneS += Date().timeIntervalSince(t0) }
         let logits = logitsAll[0..., (logitsAll.dim(1) - nPredict)..., 0...]
         var toks: [MLXArray] = []
         var lps: [MLXArray] = []
@@ -154,8 +163,10 @@ public final class MTPSession: @unchecked Sendable {
             hiddenIn = hiddenLast
             nextIds = mainTok.reshaped(1, 1)
         }
+        let tmtp = Self.decodeDiag ? Date() : nil
         let mtpLogitsAll = model.mtpForward(
             hiddenIn, nextTokenIds: nextIds, cache: mtpCache.map { $0 as KVCache? })
+        if let tmtp { eval(mtpLogitsAll); diagMTPS += Date().timeIntervalSince(tmtp) }
         let mtpLogits = mtpLogitsAll[0..., -1, 0...].squeezed(axis: 0)
         let (t, lp, alp) = processAndSample(mtpLogits)
         return (t, lp, alp)
@@ -203,9 +214,11 @@ public final class MTPSession: @unchecked Sendable {
         if prefillStart == nil { prefillStart = Date() }
         guard prefillTotal > 1 else { finishPrefill(); return false }
         var n = min(prefillStep, prefillTotal - 1)
-        // Stop the chunk exactly on the capture boundary so the cache encodes exactly that many
+        // Stop the chunk exactly on the next capture boundary so the cache encodes exactly that many
         // tokens when we snapshot.
-        if let b = captureBoundary, b > prefilled, b < prefilled + n { n = b - prefilled }
+        if let next = captureBoundaries.filter({ $0 > prefilled }).min(), next < prefilled + n {
+            n = next - prefilled
+        }
         let chunk = prefillY[0 ..< n]
         // Prefill only needs the cache warmed; the logits are discarded. Use prefillBackbone, which
         // skips the LM head (a wasted [1, chunk, vocab] matmul per chunk). MTP head also not warmed
@@ -222,38 +235,63 @@ public final class MTPSession: @unchecked Sendable {
         prefillY = prefillY[n...]
         prefillTotal -= n
         prefilled += n
-        // The single snapshot, taken once exactly at the block boundary.
-        if let b = captureBoundary, prefilled == b, !captured {
-            captured = true
+        // Snapshot whenever we land exactly on a planned capture boundary (each taken once). Bounded
+        // count (≤ captureBoundaries.count); the byte-capped LRU bounds total memory.
+        if captureBoundaries.contains(prefilled), !capturedAt.contains(prefilled) {
+            capturedAt.insert(prefilled)
             pendingSnapshots.append((
-                Array(promptTokensArray.prefix(b)),
+                Array(promptTokensArray.prefix(prefilled)),
                 modelCache.map { $0.copy() }, mtpCache.map { $0.copy() }))
         }
         if prefillTotal <= 1 { finishPrefill(); return false }
         return true
     }
 
-    /// The single block-aligned position to snapshot: the largest multiple of `snapshotBlock` that is
-    /// ≥ minReuse, > what we restored, and < promptLen (so a non-empty suffix remains — `reuseCount`
-    /// requires the snapshot be strictly shorter than any prompt sharing it). nil = nothing worth
-    /// snapshotting (prompt too short).
+    /// The capped, ascending list of token positions to snapshot, each a block-aligned multiple of
+    /// `snapshotBlock`, ≥ minReuse, > skipPrefill, < promptLen (a non-empty suffix must remain —
+    /// `reuseCount` requires the snapshot be strictly shorter than any prompt sharing it).
     ///
-    /// Placed at the block-aligned length of the prefix this prompt SHARES with the most-recent
-    /// cached prompt (`referenceTokens`) — i.e. the stable region (system prompt) likely to recur —
-    /// so a future request sharing that region reuses it. Falls back to the largest block boundary
-    /// below the prompt when there's no reference yet (first request of a family) so request #2 has
-    /// something to match; request #2 then snapshots at the now-known shared boundary.
-    private lazy var captureBoundary: Int? = {
+    /// - WARM (we have a `referenceTokens`): ONE snapshot at the block-aligned length of the prefix
+    ///   SHARED with the previous prompt — the stable region (system prompt) that recurs. Minimal
+    ///   memory, exactly where the next turn will reuse.
+    /// - COLD (no reference, first request of a family): we don't yet know where future turns
+    ///   diverge, so capture a SMALL bounded set of coarse boundaries spread across the prompt
+    ///   (≈ `coldCaptureCount` of them). A diverging follow-up then finds an aligned boundary INSIDE
+    ///   the shared region and reuses it — fixing the "turn 2 re-prefills the whole prompt" miss.
+    ///   Bounded count + byte-capped LRU keep RAM in check.
+    private static let coldCaptureCount = 4
+    private lazy var captureBoundaries: Set<Int> = {
+        let usable = promptCount - 1  // leave ≥1 token suffix
+        func align(_ x: Int) -> Int { (x / snapshotBlock) * snapshotBlock }
+        func valid(_ b: Int) -> Bool { b >= 16 && b > skipPrefill && b < promptCount }
+
         let shared = MTPCacheReuse.commonPrefixLength(referenceTokens, promptTokensArray)
-        let target = shared >= snapshotBlock ? shared : (promptCount - 1)
-        let b = (target / snapshotBlock) * snapshotBlock
-        return (b >= 16 && b > skipPrefill && b < promptCount) ? b : nil
+        if shared >= snapshotBlock {
+            // Warm: single snapshot at the known shared boundary.
+            let b = align(shared)
+            return valid(b) ? [b] : []
+        }
+        // Cold: spread a few coarse boundaries across [skipPrefill, usable).
+        let span = usable - skipPrefill
+        guard span >= snapshotBlock else {
+            let b = align(usable); return valid(b) ? [b] : []
+        }
+        var set = Set<Int>()
+        for i in 1 ... Self.coldCaptureCount {
+            let pos = skipPrefill + span * i / (Self.coldCaptureCount + 1)
+            let b = align(pos)
+            if valid(b) { set.insert(b) }
+        }
+        // Always include the largest aligned boundary too (so the next IDENTICAL prompt reuses fully).
+        let tail = align(usable)
+        if valid(tail) { set.insert(tail) }
+        return set
     }()
 
     /// Cached host copy of the prompt tokens (avoids re-reading the MLXArray each boundary check).
     private lazy var promptTokensArray: [Int32] = promptTokens.asArray(Int32.self)
 
-    private var captured = false
+    private var capturedAt: Set<Int> = []
 
     private func finishPrefill() {
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
@@ -269,6 +307,9 @@ public final class MTPSession: @unchecked Sendable {
     /// finished and `result` populated. Must be called inside the container.
     public func decodeStepOnce() -> Bool {
         if stopped || ntoks >= maxTokens { finishDecode(); return false }
+        if Self.decodeDiag { diagSteps += 1 }
+        let stepT0 = Self.decodeDiag ? Date() : nil
+        defer { if let stepT0 { diagStepWallS += Date().timeIntervalSince(stepT0) } }
 
         if draftTok == nil {
             let (toks, lps, _, hidden) = stepBackbone(y, nPredict: 1, nConfirmed: 0)
@@ -357,6 +398,14 @@ public final class MTPSession: @unchecked Sendable {
             stopReason: (!stopped && ntoks >= maxTokens) ? .length : .stop)
         continuation.yield(.info(info))
         continuation.finish()
+        if Self.decodeDiag, diagSteps > 0 {
+            let steps = Double(diagSteps)
+            let bb = String(format: "%.1f", diagBackboneS / steps * 1000)
+            let mtp = String(format: "%.1f", diagMTPS / steps * 1000)
+            let wall = String(format: "%.1f", diagStepWallS / steps * 1000)
+            FileHandle.standardError.write(Data(
+                "[DECODE] ctx=\(promptCount) steps=\(diagSteps) gen=\(ntoks) backbone=\(bb)ms mtp=\(mtp)ms STEPWALL=\(wall)ms (unaccounted=\(String(format: "%.1f", (diagStepWallS-diagBackboneS-diagMTPS)/steps*1000))ms) total=\(String(format: "%.1f", elapsed))s\n".utf8))
+        }
     }
 
     /// Abort (client disconnect): finish the stream without populating `result` (caches are
