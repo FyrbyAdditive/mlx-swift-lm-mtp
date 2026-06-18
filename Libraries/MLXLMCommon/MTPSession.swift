@@ -39,6 +39,21 @@ public final class MTPSession: @unchecked Sendable {
     /// block-aligned length of the SHARED prefix (the recurring system prompt). Empty if none cached.
     private let referenceTokens: [Int32]
     private let result: MTPCacheResult?
+
+    // --- Reasoning-token budget (hard cap on the <think> block) ---
+    /// Max reasoning tokens before we FORCE-close `<think>`. ≤0 = uncapped.
+    private let reasoningBudget: Int
+    /// The model starts inside the template-pre-opened `<think>` block. We count tokens until we see
+    /// `</think>` in the decoded text (model self-closed) or we force-close at the budget.
+    private var inThink: Bool
+    private var reasoningTokens = 0
+    private var thinkForceClosed = false
+    /// Tail of decoded text, scanned for a self-emitted `</think>` so we stop counting.
+    private var thinkScanTail = ""
+    /// Wall-clock spent inside the `<think>` block (for the env-gated telemetry). Stamped when the
+    /// block closes (self-closed or force-closed); the start is `decodeStart`.
+    private var reasoningSeconds: Double?
+    private var decodeStart: Date?
     private var prefillY: MLXArray
     private var prefillTotal: Int
     private var prefilled: Int
@@ -80,6 +95,7 @@ public final class MTPSession: @unchecked Sendable {
         snapshotAt: Int,
         snapshotBlock: Int = 512,
         referenceTokens: [Int32] = [],
+        reasoningBudget: Int = 0,
         stopTokenIds: Set<Int>,
         continuation: AsyncStream<Generation>.Continuation,
         result: MTPCacheResult?
@@ -100,6 +116,11 @@ public final class MTPSession: @unchecked Sendable {
         self.snapshotAt = snapshotAt
         self.snapshotBlock = max(1, snapshotBlock)
         self.referenceTokens = referenceTokens
+        self.reasoningBudget = reasoningBudget
+        // Track reasoning when a budget is set (to enforce it) OR when the decode diagnostic is on
+        // (to MEASURE the reasoning cost even uncapped). The Qwen template pre-opens `<think>` on the
+        // assistant turn, so decode starts inside the reasoning block.
+        self.inThink = reasoningBudget > 0 || Self.decodeDiag
         self.result = result
         self.detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
 
@@ -194,7 +215,21 @@ public final class MTPSession: @unchecked Sendable {
         let id = tokenArray.item(Int.self)
         if stopTokenIds.contains(id) { stopped = true; return true }
         detokenizer.append(token: id)
-        if let chunk = detokenizer.next() { continuation.yield(.chunk(chunk)) }
+        if let chunk = detokenizer.next() {
+            // Reasoning-budget tracking: count tokens while inside the pre-opened `<think>` block;
+            // if the model self-emits `</think>`, stop counting (it finished reasoning on its own).
+            if inThink {
+                reasoningTokens += 1
+                thinkScanTail += chunk
+                if thinkScanTail.contains("</think>") {
+                    inThink = false; thinkScanTail = ""
+                    if let s = decodeStart { reasoningSeconds = Date().timeIntervalSince(s) }
+                } else if thinkScanTail.count > 16 {
+                    thinkScanTail = String(thinkScanTail.suffix(16))  // keep enough to span the tag
+                }
+            }
+            continuation.yield(.chunk(chunk))
+        }
         _ = lp
         ntoks += 1
         return false
@@ -293,6 +328,31 @@ public final class MTPSession: @unchecked Sendable {
 
     private var capturedAt: Set<Int> = []
 
+    /// Force the model out of the `<think>` block by feeding a graceful transition string into its
+    /// context (Qwen's reference approach: a sentence that wraps up + `</think>`), so the model's next
+    /// generated tokens are the answer rather than more reasoning. Runs the transition tokens through
+    /// the backbone to advance the KV/conv caches, emits the transition text to the client, resets the
+    /// pending MTP draft, and points `y` at the last transition token. Called at most once.
+    private func forceCloseThink() {
+        thinkForceClosed = true
+        inThink = false
+        if let s = decodeStart { reasoningSeconds = Date().timeIntervalSince(s) }
+        let transition = "\nConsidering the limited time, I'll answer based on the above.\n</think>\n\n"
+        let ids = context.tokenizer.encode(text: transition).map { Int32($0) }
+        guard !ids.isEmpty else { return }
+        let arr = MLXArray(ids)
+        // Advance the backbone over the transition (nConfirmed=0: no draft split). Discard logits.
+        _ = stepBackbone(arr, nPredict: 1, nConfirmed: 0)
+        clearRollback()
+        // Emit the transition text so the SSE stream sees the think block close (ThinkParser routes
+        // the part up to `</think>` as reasoning, the rest as the answer's lead-in).
+        for id in ids { detokenizer.append(token: Int(id)) }
+        if let chunk = detokenizer.next() { continuation.yield(.chunk(chunk)) }
+        // Resume normal decode from the last transition token; rebuild the draft next step.
+        draftTok = nil
+        y = MLXArray([ids[ids.count - 1]]).asType(.uint32)
+    }
+
     private func finishPrefill() {
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
         // Decode begins from the final prompt token (the standard loop sets y to the last token via
@@ -300,6 +360,7 @@ public final class MTPSession: @unchecked Sendable {
         // prefill of all but the last token, and decode's first backbone step consumes the last one).
         y = promptTokens[(promptCount - 1)...].asType(.uint32)
         phase = .decoding
+        if Self.decodeDiag || reasoningBudget > 0 { decodeStart = Date() }
     }
 
     /// Perform ONE decode iteration (the body of mtpGenerate's `while`). Returns true while more
@@ -310,6 +371,13 @@ public final class MTPSession: @unchecked Sendable {
         if Self.decodeDiag { diagSteps += 1 }
         let stepT0 = Self.decodeDiag ? Date() : nil
         defer { if let stepT0 { diagStepWallS += Date().timeIntervalSince(stepT0) } }
+
+        // HARD reasoning-token cap: if the model is still reasoning past the budget, force-close the
+        // `<think>` block by feeding a graceful transition into its context, so its next tokens are
+        // the ANSWER. We don't trust the model to self-limit (it usually won't). Done once.
+        if reasoningBudget > 0, inThink, !thinkForceClosed, reasoningTokens >= reasoningBudget {
+            forceCloseThink()
+        }
 
         if draftTok == nil {
             let (toks, lps, _, hidden) = stepBackbone(y, nPredict: 1, nConfirmed: 0)
@@ -405,6 +473,10 @@ public final class MTPSession: @unchecked Sendable {
             let wall = String(format: "%.1f", diagStepWallS / steps * 1000)
             FileHandle.standardError.write(Data(
                 "[DECODE] ctx=\(promptCount) steps=\(diagSteps) gen=\(ntoks) backbone=\(bb)ms mtp=\(mtp)ms STEPWALL=\(wall)ms (unaccounted=\(String(format: "%.1f", (diagStepWallS-diagBackboneS-diagMTPS)/steps*1000))ms) total=\(String(format: "%.1f", elapsed))s\n".utf8))
+            let rt = reasoningSeconds.map { String(format: "%.1f", $0) } ?? "n/a"
+            let close = thinkForceClosed ? "forced" : (inThink ? "open" : "self")
+            FileHandle.standardError.write(Data(
+                "[REASONING] tokens=\(reasoningTokens) budget=\(reasoningBudget) close=\(close) time=\(rt)s\n".utf8))
         }
     }
 
