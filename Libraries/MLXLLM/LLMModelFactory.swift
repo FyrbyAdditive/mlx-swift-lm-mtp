@@ -359,7 +359,11 @@ public class LLMRegistry: AbstractModelRegistry, @unchecked Sendable {
 
     static public let gpt_oss_20b_MXFP4_Q8 = ModelConfiguration(
         id: "mlx-community/gpt-oss-20b-MXFP4-Q8",
-        defaultPrompt: "Why is the sky blue?"
+        defaultPrompt: "Why is the sky blue?",
+        // gpt-oss uses the OpenAI "harmony" format: `<|return|>` ends the assistant turn (the model's
+        // EOS) and `<|call|>` ends a tool call. Register `<|call|>` as an extra stop so generation
+        // halts at a tool-call boundary instead of running on past it (`<|return|>` is already EOS).
+        extraEOSTokens: ["<|call|>"]
     )
 
     static public let jamba_3b = ModelConfiguration(
