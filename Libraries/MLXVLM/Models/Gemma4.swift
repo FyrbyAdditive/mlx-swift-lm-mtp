@@ -1100,12 +1100,20 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         cache: [KVCache]? = nil,
         inputsEmbeds: MLXArray? = nil,
         perLayerInputs: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil
+        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
+        lastTokenOnly: Bool = false
     ) -> LMOutput {
-        let output = model(
+        var output = model(
             inputs, inputsEmbeds: inputsEmbeds, mask: mask, cache: cache?.map { $0 as KVCache? },
             perLayerInputs: perLayerInputs
         )
+        // Only the last position's logits are ever used to pick the next token. Slicing the backbone
+        // output to the final position BEFORE the lm_head projection turns a `[B, seq, vocab]`
+        // (262144-wide → multi-GB at long context) transient into `[B, 1, vocab]`. Use a RANGE (`-1...`)
+        // so the length axis survives — `TokenIterator.convertToToken` indexes `logits[0..., -1, 0...]`.
+        if lastTokenOnly {
+            output = output[0..., (-1)..., 0...]
+        }
         let logits: MLXArray
         if let lmHead {
             logits = lmHead(output)
@@ -1724,21 +1732,53 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
+        let prefillStepSize = windowSize ?? 512
         let convertedCache = cache.map { $0 }
+
         if let imagePixels = input.image?.pixels {
+            // Image path: image features are scatter-interleaved into the embeddings and don't slice
+            // cleanly, so run the (typically modest-length) image+text prompt in one pass — but compute
+            // logits for ONLY the last position to avoid the `[seq × vocab]` transient.
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
             let result = languageModel(
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
-                perLayerInputs: perLayerInputs
+                perLayerInputs: perLayerInputs,
+                lastTokenOnly: true
             )
             return .logits(result)
-        } else {
-            let result = languageModel(input.text.tokens, cache: convertedCache)
-            return .logits(result)
         }
+
+        // Text-only path: chunk the prompt so the live activations and the `[seq × vocab]` logits are
+        // bounded by `prefillStepSize` instead of the full prompt length (the cause of the ~60GB spike
+        // on long contexts). The backbone derives `perLayerInputs` internally from each token slice, so
+        // we only slice the tokens. `eval(cache)` between chunks is REQUIRED — it materializes the cache
+        // and frees each chunk's transient graph before the next allocates. The remainder is returned
+        // as `.tokens`, which the TokenIterator steps while computing only the last-token logits.
+        //
+        // NOTE: Gemma4's processor produces a 2D `[1, seq]` token array (`expandedDimensions(axis: 0)`).
+        // We feed each chunk to the model as 2D `[1, chunk]` (it expects a batch axis), but return the
+        // remainder as 1D `[seq]` — `TokenIterator.step` re-adds the batch axis via `[text: .newAxis]`,
+        // so a 2D remainder would become 3D and crash.
+        let tokens2D = input.text.tokens
+        let seqLen = tokens2D.dim(tokens2D.ndim - 1)
+        // Flatten to 1D for the remainder/return; chunks are re-expanded to [1, chunk] when fed.
+        let flat = tokens2D.reshaped([seqLen])
+        if seqLen > prefillStepSize {
+            var start = 0
+            // Leave at least one token for the TokenIterator to step (it produces the first logits).
+            while seqLen - start > prefillStepSize {
+                let chunk = flat[start ..< (start + prefillStepSize)].expandedDimensions(axis: 0)
+                _ = languageModel(chunk, cache: convertedCache)
+                eval(convertedCache)
+                start += prefillStepSize
+            }
+            let remainder = flat[start...]
+            return .tokens(.init(tokens: remainder, mask: nil))
+        }
+        return .tokens(.init(tokens: flat, mask: nil))
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
