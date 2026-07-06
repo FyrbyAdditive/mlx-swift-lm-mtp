@@ -169,6 +169,23 @@ public class Qwen3ModelInner: Module {
 
         return norm(h)
     }
+
+    /// Layer loop with DSpark hidden-state taps: capture the residual stream AFTER each
+    /// layer in `tapLayers` (pre-final-norm), concatenated on the feature axis.
+    /// Identical math to `callAsFunction` — the taps are reads, not extra compute.
+    func callWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> (normed: MLXArray, taps: MLXArray) {
+        var h = embedTokens(inputs)
+        let mask = createAttentionMask(h: h, cache: cache?.first)
+        let tapSet = Set(tapLayers)
+        var taps: [MLXArray] = []
+        for (i, layer) in layers.enumerated() {
+            h = layer(h, mask: mask, cache: cache?[i])
+            if tapSet.contains(i) { taps.append(h) }
+        }
+        return (norm(h), concatenated(taps, axis: -1))
+    }
 }
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -280,5 +297,25 @@ public struct Qwen3Configuration: Codable, Sendable {
 extension Qwen3Model: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - DSpark target
+
+extension Qwen3Model: DSparkTargetModel {
+    public func forwardWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> (logits: MLXArray, taps: MLXArray) {
+        let (normed, taps) = model.callWithTaps(inputs, cache: cache, tapLayers: tapLayers)
+        let logits = lmHead.map { $0(normed) } ?? model.embedTokens.asLinear(normed)
+        return (logits, taps)
+    }
+
+    public func prefillWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> MLXArray {
+        // The final norm/LM head nodes are created but never consumed — MLX laziness means
+        // they are never computed during prefill.
+        model.callWithTaps(inputs, cache: cache, tapLayers: tapLayers).taps
     }
 }

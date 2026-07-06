@@ -17,3 +17,15 @@ MLX Swift was developed with contributions from the following individuals:
 
 SOFTWARE.
 
+
+## DSpark speculative decoding
+
+The `MLXLMCommon/DSpark` module is a Swift port of DeepSeek's DSpark drafter
+(paper: "DSpark: Confidence-Scheduled Speculative Decoding with Semi-Autoregressive
+Generation", DeepSeek-AI, arXiv:2606.19348), informed by two MIT-licensed reference
+implementations:
+
+- DeepSpec (DeepSeek-AI) — official training/eval code and drafter checkpoints:
+  https://github.com/deepseek-ai/DeepSpec (MIT)
+- mlx-dspark (Abdur Rahim) — Python MLX inference port:
+  https://github.com/ARahim3/mlx-dspark (MIT)

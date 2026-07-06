@@ -258,6 +258,35 @@ public class DSparkDrafter: Module {
         return concatenated(tokens)
     }
 
+    /// Sampled semi-autoregressive block for speculative SAMPLING: each position draws
+    /// from its temperature-scaled, top-p/top-k-truncated distribution q_i. Returns the
+    /// drafted tokens and the q distributions they were sampled from — the verifier needs
+    /// them for the min(1, p/q) accept test and residual resampling. Truncating q with the
+    /// SAME parameters as the target keeps acceptance from collapsing under nucleus
+    /// sampling; losslessness comes from the target side. Sequential (Markov bias for
+    /// position i depends on the token sampled at i−1).
+    public func sampleBlockProbs(
+        _ baseLogits: MLXArray, firstPrevToken: Int32,
+        temperature: Float, topP: Float = 1.0, topK: Int = 0
+    ) -> (tokens: MLXArray, probs: MLXArray) {
+        let k = baseLogits.dim(0)
+        let invT = 1 / temperature
+        var tokens: [MLXArray] = []
+        var probs: [MLXArray] = []
+        var prev = MLXArray([firstPrevToken])
+        for i in 0 ..< k {
+            var logits = baseLogits[i]
+            if let markovHead { logits = logits + markovHead.stepBias(prev)[0] }
+            let q = SpeculativeVerifier.truncateProbs(
+                softmax(logits * invT, axis: -1), topP: topP, topK: topK)
+            probs.append(q)
+            let next = categorical(log(q + 1e-20)).reshaped([1])
+            tokens.append(next)
+            prev = next
+        }
+        return (concatenated(tokens), stacked(probs, axis: 0))
+    }
+
     /// Confidence logits for each block position (sigmoid → conditional survival
     /// probability). `blockHidden` [k, H]; `prevTokenIds` [k] = [pending, draft[0..k-2]].
     public func confidenceLogits(_ blockHidden: MLXArray, prevTokenIds: MLXArray) -> MLXArray? {
