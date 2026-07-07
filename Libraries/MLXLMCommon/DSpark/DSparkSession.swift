@@ -87,6 +87,10 @@ public final class DSparkSession: @unchecked Sendable {
     private var nCached = 0
     private var ntoks = 0
     private var stopped = false
+    /// Exact token ids the target cache encodes (== nCached entries). Snapshotted whole
+    /// at finish so the NEXT agentic turn trim-reuses prompt+reply, not just a coarse
+    /// 512-aligned prefill boundary (TTFT parity with the plain path's live trim-reuse).
+    private var cachedTokens: [Int32] = []
     private var detokenizer: NaiveStreamingDetokenizer
 
     public private(set) var phase: Phase = .prefilling
@@ -243,6 +247,7 @@ public final class DSparkSession: @unchecked Sendable {
         eval(tok)
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
         nCached = promptCount
+        cachedTokens = promptTokensArray
         pending = tok.item(Int32.self)
         phase = .decoding
         if Self.decodeDiag || reasoningBudget > 0 { decodeStart = Date() }
@@ -382,6 +387,8 @@ public final class DSparkSession: @unchecked Sendable {
         if trim > 0 { trimPromptCache(modelCache, numTokens: trim) }
         drafter.updateContext(vTaps[0..., 0 ..< (n + 1), 0...], ctxCaches: ctxCaches)
         nCached += n + 1
+        cachedTokens.append(pending)
+        cachedTokens.append(contentsOf: committed.prefix(n))
         asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
 
         if let roundT0 {
@@ -426,6 +433,8 @@ public final class DSparkSession: @unchecked Sendable {
         asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
         nCached += maxSteps
         let ids = tokens.map { $0.item(Int32.self) }  // one pipeline sync for the batch
+        cachedTokens.append(pending)
+        cachedTokens.append(contentsOf: ids.prefix(maxSteps - 1))
         if Self.decodeDiag { diagPlainSteps += maxSteps }
         let msPerToken = Date().timeIntervalSince(t0) * 1000 / Double(maxSteps)
         for _ in 0 ..< maxSteps {
@@ -484,6 +493,7 @@ public final class DSparkSession: @unchecked Sendable {
         drafter.updateContext(taps, ctxCaches: ctxCaches)
         eval(ctxCaches.map { $0.state }.flatMap { $0 })
         nCached += feed.count
+        cachedTokens.append(contentsOf: feed)
         for id in ids { detokenizer.append(token: Int(id)) }
         if let chunk = detokenizer.next() { continuation.yield(.chunk(chunk)) }
         pending = ids[ids.count - 1]
@@ -492,6 +502,13 @@ public final class DSparkSession: @unchecked Sendable {
     private func finishDecode() {
         guard phase != .finished else { return }
         phase = .finished
+        // Whole-state snapshot: the next agentic turn's prompt extends [prompt + reply],
+        // so this reuses everything but the new user suffix. Byte-capped LRU bounds RAM;
+        // tiny generations aren't worth a slot.
+        if nCached >= 256, cachedTokens.count == nCached {
+            pendingSnapshots.append((
+                cachedTokens, modelCache.map { $0.copy() }, ctxCaches.map { $0.copy() }))
+        }
         if let tail = detokenizer.next(), !tail.isEmpty { continuation.yield(.chunk(tail)) }
         result?.promptTokens = promptTokensArray
         let elapsed = Date().timeIntervalSince(start)
