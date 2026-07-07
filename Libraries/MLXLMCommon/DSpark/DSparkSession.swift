@@ -46,7 +46,7 @@ public final class DSparkSession: @unchecked Sendable {
     private let confidenceThreshold: Float
 
     private var modelCache: [KVCache]
-    private let ctxCaches: [KVCacheSimple]
+    private let ctxCaches: [KVCache]
 
     // Prompt + prefill bookkeeping (mirrors MTPSession).
     private let promptTokens: MLXArray
@@ -115,7 +115,7 @@ public final class DSparkSession: @unchecked Sendable {
         parameters: GenerateParameters,
         promptTokens: MLXArray,
         modelCache: [KVCache],
-        ctxCaches: [KVCacheSimple],
+        ctxCaches: [KVCache],
         skipPrefill: Int,
         snapshotBlock: Int = 512,
         referenceTokens: [Int32] = [],

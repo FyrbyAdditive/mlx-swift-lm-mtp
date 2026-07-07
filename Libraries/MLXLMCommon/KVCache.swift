@@ -1977,13 +1977,20 @@ public func quantizedScaledDotProductAttention(
     // by slicing each row's key prefix, so M independent single-row attentions — each on
     // the fast qmv path, exactly the kernel plain decode uses — produce the identical
     // result. Kill switch: MLXZ_QKV_ROWSPLIT=0.
-    if rowSplitEnabled, L > 1, L <= 8, case .causal = mask {
+    let rowSplitKind: Int  // 0 = no, 1 = causal, 2 = unmasked (all rows see all keys)
+    switch mask {
+    case .causal: rowSplitKind = 1
+    case .none: rowSplitKind = 2
+    default: rowSplitKind = 0
+    }
+    if rowSplitEnabled, L > 1, L <= 8, rowSplitKind > 0 {
         let kL = qKeys.0.dim(-2)
         var rows: [MLXArray] = []
         rows.reserveCapacity(L)
         for i in 0 ..< L {
-            // Row i (aligned to the cache tail) attends keys [0, kL - L + i].
-            let kEnd = kL - L + i + 1
+            // Causal: row i (aligned to the cache tail) attends keys [0, kL - L + i].
+            // Unmasked (drafter block attention): every row attends all keys.
+            let kEnd = rowSplitKind == 1 ? kL - L + i + 1 : kL
             let q = scaledQueries[.ellipsis, i ..< (i + 1), 0...]
             var s = quantizedMM(
                 q, qKeys.0[.ellipsis, ..<kEnd, 0...],

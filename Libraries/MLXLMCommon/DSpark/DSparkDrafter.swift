@@ -90,14 +90,21 @@ class DSparkAttention: Module {
 
     /// Append newly committed fused-context positions to this layer's ctx cache.
     /// K is roped at its absolute position; V is not roped (reference semantics).
-    func updateContext(_ fusedNew: MLXArray, cache: KVCacheSimple) {
+    /// Quantized ctx caches quantize on append (correctness unaffected — the target
+    /// verifies every token; only acceptance can shift on near-ties).
+    func updateContext(_ fusedNew: MLXArray, cache: KVCache) {
         let (k, v) = kv(fusedNew)
-        _ = cache.update(keys: rope(k, offset: cache.offset), values: v)
+        let roped = rope(k, offset: cache.offset)
+        if let qc = cache as? QuantizedKVCacheProtocol {
+            _ = qc.updateQuantized(keys: roped, values: v)
+        } else {
+            _ = cache.update(keys: roped, values: v)
+        }
     }
 
     /// One block attention: `hidden` [B, k, H] at absolute position `blockOffset`.
     /// No mask — the block attends the whole context plus every block position.
-    func attend(_ hidden: MLXArray, blockOffset: Int, cache: KVCacheSimple) -> MLXArray {
+    func attend(_ hidden: MLXArray, blockOffset: Int, cache: KVCache) -> MLXArray {
         let (B, qLen) = (hidden.dim(0), hidden.dim(1))
         var q = qNorm(qProj(hidden).reshaped(B, qLen, nHeads, headDim)).transposed(0, 2, 1, 3)
         q = rope(q, offset: blockOffset)
@@ -105,15 +112,43 @@ class DSparkAttention: Module {
         var (kBlk, vBlk) = kv(hidden)
         kBlk = rope(kBlk, offset: blockOffset)
 
-        let ctx = cache.state
-        let keys = ctx.isEmpty ? kBlk : concatenated([ctx[0], kBlk], axis: 2)
-        let values = ctx.isEmpty ? vBlk : concatenated([ctx[1], vBlk], axis: 2)
-
-        let out = MLXFast.scaledDotProductAttention(
-            queries: q, keys: keys, values: values, scale: scale, mask: .none
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, qLen, -1)
+        let out: MLXArray
+        if let qc = cache as? QuantizedKVCache {
+            // Quantized ctx: quantize the block's K/V too and run the quantized SDPA
+            // (its unmasked small-M row split keeps every row on the fast qmv path).
+            let qkBlk = quantized(kBlk, groupSize: qc.groupSize, bits: qc.bits)
+            let qvBlk = quantized(vBlk, groupSize: qc.groupSize, bits: qc.bits)
+            var qk = (qkBlk.wq, qkBlk.scales, qkBlk.biases)
+            var qv = (qvBlk.wq, qvBlk.scales, qvBlk.biases)
+            if let (ctxK, ctxV) = qc.getQuantizedState(), qc.offset > 0 {
+                func cat(_ a: (MLXArray, MLXArray, MLXArray?), _ b: (MLXArray, MLXArray, MLXArray?))
+                    -> (MLXArray, MLXArray, MLXArray?)
+                {
+                    (
+                        concatenated([a.0, b.0], axis: -2),
+                        concatenated([a.1, b.1], axis: -2),
+                        a.2.flatMap { az in b.2.map { concatenated([az, $0], axis: -2) } }
+                    )
+                }
+                qk = cat(ctxK, qk)
+                qv = cat(ctxV, qv)
+            }
+            out = quantizedScaledDotProductAttention(
+                queries: q, quantizedKeys: qk, quantizedValues: qv,
+                scale: scale, mask: .none, groupSize: qc.groupSize, bits: qc.bits
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, qLen, -1)
+        } else {
+            let ctx = cache.state
+            let keys = ctx.isEmpty ? kBlk : concatenated([ctx[0], kBlk], axis: 2)
+            let values = ctx.isEmpty ? vBlk : concatenated([ctx[1], vBlk], axis: 2)
+            out = MLXFast.scaledDotProductAttention(
+                queries: q, keys: keys, values: values, scale: scale, mask: .none
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, qLen, -1)
+        }
         return oProj(out)
     }
 }
@@ -150,7 +185,7 @@ class DSparkDecoderLayer: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
-    func callAsFunction(_ x: MLXArray, blockOffset: Int, cache: KVCacheSimple) -> MLXArray {
+    func callAsFunction(_ x: MLXArray, blockOffset: Int, cache: KVCache) -> MLXArray {
         let h = x + selfAttn.attend(inputLayerNorm(x), blockOffset: blockOffset, cache: cache)
         return h + mlp(postAttentionLayerNorm(h))
     }
@@ -195,10 +230,13 @@ public class DSparkDrafter: Module {
         }
     }
 
-    /// One append-only context cache per layer. `KVCacheSimple` gives trim (prefix-cache
-    /// restore) and copy (snapshots) for free.
-    public func makeContextCaches() -> [KVCacheSimple] {
-        layers.map { _ in KVCacheSimple() }
+    /// One append-only context cache per layer; trim (prefix-cache restore) and copy
+    /// (snapshots) come free from either kind. Pass `kvBits` to quantize the ctx cache
+    /// (fp16 ctx costs ~20KB/token on the qwen3_8b drafter — 650MB at 32k context).
+    public func makeContextCaches(kvBits: Int? = nil, groupSize: Int = 64) -> [KVCache] {
+        layers.map { _ in
+            kvBits.map { QuantizedKVCache(groupSize: groupSize, bits: $0) } ?? KVCacheSimple()
+        }
     }
 
     public func embed(_ ids: MLXArray) -> MLXArray {
@@ -214,7 +252,7 @@ public class DSparkDrafter: Module {
     /// Append newly committed target positions to every layer's context cache.
     /// `targetHiddenCat` is [B, S, tapCount·H] for exactly the committed tokens; each
     /// cache's offset must already equal those tokens' absolute start position.
-    public func updateContext(_ targetHiddenCat: MLXArray, ctxCaches: [KVCacheSimple]) {
+    public func updateContext(_ targetHiddenCat: MLXArray, ctxCaches: [KVCache]) {
         let fused = fuseTarget(targetHiddenCat)
         for (layer, cache) in zip(layers, ctxCaches) {
             layer.selfAttn.updateContext(fused, cache: cache)
@@ -224,7 +262,7 @@ public class DSparkDrafter: Module {
     /// Run the block backbone: `noiseEmbedding` [B, k, H] (embedded [pending] + mask ids)
     /// at absolute position `blockOffset`. Returns final-normed hidden states [B, k, H].
     public func backbone(
-        _ noiseEmbedding: MLXArray, blockOffset: Int, ctxCaches: [KVCacheSimple]
+        _ noiseEmbedding: MLXArray, blockOffset: Int, ctxCaches: [KVCache]
     ) -> MLXArray {
         var h = noiseEmbedding
         for (layer, cache) in zip(layers, ctxCaches) {
