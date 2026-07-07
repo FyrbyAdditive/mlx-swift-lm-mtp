@@ -21,6 +21,18 @@ public protocol DSparkTargetModel: LanguageModel {
     /// avoid materializing the LM head over the chunk (with MLX laziness, simply not
     /// consuming the logits suffices).
     func prefillWithTaps(_ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]) -> MLXArray
+
+    /// Caches for DSpark sessions. Defaults to `newCache`; models whose standard caches
+    /// cannot be soundly TRIMMED (rotating sliding-window layers — verify rollback trims
+    /// every round) override with full-length caches and enforce windowing via masks in
+    /// their tap forwards.
+    func dsparkCache(parameters: GenerateParameters?) -> [KVCache]
+}
+
+extension DSparkTargetModel {
+    public func dsparkCache(parameters: GenerateParameters?) -> [KVCache] {
+        newCache(parameters: parameters)
+    }
 }
 
 /// Whether a loaded model can serve as a DSpark target for a drafter expecting

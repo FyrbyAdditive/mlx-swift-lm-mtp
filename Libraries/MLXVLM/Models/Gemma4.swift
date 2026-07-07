@@ -1052,6 +1052,71 @@ private final class Gemma4TextBackbone: Module {
         }
         return norm(h)
     }
+
+    /// DSpark tap forward: the standard layer loop with (a) residual-stream captures after
+    /// `tapLayers` (pre-final-norm, concatenated on the feature axis) and (b) a FORCED
+    /// sliding-window boolean mask at every step size. DSpark sessions run sliding layers
+    /// on full-length (non-rotating) caches — rollback needs sound trims — so windowing
+    /// must come from the mask, including the S==1 steps where the default mask path
+    /// returns .none (correct only when the cache CONTENTS are windowed).
+    func callWithTaps(
+        _ inputs: MLXArray, cache: [KVCache?]?, tapLayers: [Int]
+    ) -> (normed: MLXArray, taps: MLXArray) {
+        let embeddings = embedTokens(inputs)
+        let h0 = (embeddings * MLXArray(embedScale, dtype: .float32)).asType(embeddings.dtype)
+
+        let processedPerLayerInputs: MLXArray? =
+            config.hiddenSizePerLayerInput > 0 ? getPerLayerInputs(inputs) : nil
+        let finalPerLayerInputs = projectPerLayerInputs(h0, perLayerInputs: processedPerLayerInputs)
+
+        let localCache = cache ?? Array(repeating: nil as KVCache?, count: max(firstKVSharedLayerIdx, 1))
+        let fullMask = createAttentionMask(
+            h: h0,
+            cache: firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil)
+        // Forced window mask: query at absolute position q attends keys k with
+        // q - window < k <= q. Built for every S (the caches hold FULL history here).
+        let s = h0.dim(1)
+        let offset = (firstSlidingCacheIdx < localCache.count
+            ? localCache[firstSlidingCacheIdx]?.offset : nil) ?? 0
+        let window = config.slidingWindow > 0 ? config.slidingWindow : 4096
+        let qIdx = (MLXArray(0 ..< s) + offset).expandedDimensions(axis: -1)
+        let kIdx = MLXArray(0 ..< (offset + s)).expandedDimensions(axis: -2)
+        let slidingMask: MLXFast.ScaledDotProductAttentionMaskMode = .array(
+            logicalAnd(lessEqual(kIdx, qIdx), greater(kIdx, qIdx - window)))
+
+        var h = h0
+        let tapSet = Set(tapLayers)
+        var taps: [MLXArray] = []
+        var intermediates = [(kv: Gemma4SharedKVState?, offset: Int?)](
+            repeating: (nil, nil), count: config.hiddenLayers)
+        for (idx, layer) in layers.enumerated() {
+            let sourceIdx = layerIdxToCacheIdx[idx]
+            let layerCache: KVCache? =
+                if idx < firstKVSharedLayerIdx, sourceIdx < localCache.count {
+                    localCache[sourceIdx]
+                } else {
+                    nil
+                }
+            let layerInput: MLXArray? =
+                if let finalPerLayerInputs {
+                    finalPerLayerInputs[0..., 0..., idx, 0...]
+                } else {
+                    nil
+                }
+            let (output, kvState, attentionOffset) = layer(
+                h,
+                mask: layer.layerType == "full_attention" ? fullMask : slidingMask,
+                cache: layerCache,
+                perLayerInput: layerInput,
+                sharedKV: idx >= firstKVSharedLayerIdx ? intermediates[sourceIdx].kv : nil,
+                offset: idx >= firstKVSharedLayerIdx ? intermediates[sourceIdx].offset : nil
+            )
+            h = output
+            intermediates[idx] = (kvState, attentionOffset)
+            if tapSet.contains(idx) { taps.append(h) }
+        }
+        return (norm(h), concatenated(taps, axis: -1))
+    }
 }
 
 private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
@@ -1965,5 +2030,47 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
         }
         // 800x800 keeps the patch count under Gemma4's 280 * 3^2 vision budget.
         return CGSize(width: 800, height: 800)
+    }
+}
+
+
+// MARK: - DSpark target
+
+extension Gemma4: DSparkTargetModel {
+    public func forwardWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> (logits: MLXArray, taps: MLXArray) {
+        let (normed, taps) = languageModel.model.callWithTaps(
+            inputs, cache: cache?.map { $0 as KVCache? }, tapLayers: tapLayers)
+        var logits: MLXArray
+        if let lmHead = languageModel.lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = languageModel.model.embedTokens.asLinear(normed)
+        }
+        if let cap = languageModel.finalLogitSoftcapping, cap > 0 {
+            let scale = MLXArray(cap)
+            logits = tanh(logits / scale) * scale
+        }
+        return (logits, taps)
+    }
+
+    public func prefillWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> MLXArray {
+        // The final norm/LM head nodes are never consumed — MLX laziness skips them.
+        languageModel.model.callWithTaps(
+            inputs, cache: cache?.map { $0 as KVCache? }, tapLayers: tapLayers
+        ).taps
+    }
+
+    /// Full-length caches for EVERY layer: DSpark rollback trims the cache each round,
+    /// which is unsound on RotatingKVCache once the window wraps. Windowing is enforced
+    /// by the forced masks in `callWithTaps` instead — numerically identical, at the cost
+    /// of unbounded sliding-layer KV growth (quantizable via kvBits like any other).
+    public func dsparkCache(parameters: GenerateParameters?) -> [KVCache] {
+        let count = config.textConfiguration.hiddenLayers
+            - config.textConfiguration.numKVSharedLayers
+        return (0 ..< count).map { _ in StandardKVCache() }
     }
 }
