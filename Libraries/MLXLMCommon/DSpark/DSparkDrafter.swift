@@ -9,8 +9,11 @@
 // first `cap` positions are drafted/verified.
 //
 // Module attribute keys match the HF checkpoint 1:1 so bf16 weights load unrenamed.
-// Qwen3 drafter family only (separate v_proj, default rope, llama 2-norm, silu, no
-// softcap); the gemma4 drafter family lands with the Gemma4 target milestone.
+// Two drafter families share this path (mirrors the reference):
+//   qwen3:  separate v_proj, default rope, llama 2-norm layers, silu MLP, no softcap.
+//   gemma4: k_eq_v attention (V derives from the K projection via an unscaled RMSNorm),
+//           1 global KV head at head dim 512, proportional partial rope, sandwich norms
+//           + layer_scalar, gelu MLP, sqrt(H) embed scale, logit softcap 30.
 
 import Foundation
 import MLX
@@ -45,6 +48,12 @@ public class DSparkConfidenceHead: Module {
     }
 }
 
+/// RMSNorm with no learnable weight (the gemma4 drafter's v_norm).
+func rmsNormNoScale(_ x: MLXArray, eps: Float) -> MLXArray {
+    let f = x.asType(.float32)
+    return (f * rsqrt(f.square().mean(axis: -1, keepDims: true) + eps)).asType(x.dtype)
+}
+
 /// Cross-attention: Q from the draft block, K/V from [cached target context, block].
 /// The context cache holds already-projected (roped K, raw V) — appended via
 /// `updateContext`, read (never grown) by `attend`.
@@ -53,38 +62,60 @@ class DSparkAttention: Module {
     let nKVHeads: Int
     let headDim: Int
     let scale: Float
+    let kEqV: Bool
+    let eps: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
     @ModuleInfo(key: "k_proj") var kProj: Linear
-    @ModuleInfo(key: "v_proj") var vProj: Linear
+    @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rope: RoPE
+    let rope: OffsetLayer
 
     init(_ config: DSparkConfiguration) {
         self.nHeads = config.attentionHeads
         self.nKVHeads = config.attnKVHeads
         self.headDim = config.attnHeadDim
         self.scale = config.attnScale
+        self.kEqV = config.family == .gemma4 && config.attentionKEqualsV
+        self.eps = config.rmsNormEps
 
         let h = config.hiddenSize
         let bias = config.attentionBias
         _qProj.wrappedValue = Linear(h, nHeads * headDim, bias: bias)
         _kProj.wrappedValue = Linear(h, nKVHeads * headDim, bias: bias)
-        _vProj.wrappedValue = Linear(h, nKVHeads * headDim, bias: bias)
+        _vProj.wrappedValue = kEqV ? nil : Linear(h, nKVHeads * headDim, bias: bias)
         _oProj.wrappedValue = Linear(nHeads * headDim, h, bias: bias)
         _qNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
         _kNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        self.rope = RoPE(dimensions: headDim, traditional: false, base: config.ropeTheta, scale: 1)
+        switch config.family {
+        case .qwen3:
+            self.rope = RoPE(
+                dimensions: headDim, traditional: false, base: config.ropeTheta, scale: 1)
+        case .gemma4:
+            self.rope = ProportionalRoPE(
+                dims: headDim, traditional: false, base: config.ropeTheta,
+                scalingConfig: [
+                    "rope_type": .string("proportional"),
+                    "partial_rotary_factor": .float(config.partialRotaryFactor),
+                ])
+        }
     }
 
     /// Project x → (normed K, V), shaped [B, kvHeads, S, headDim]. K is NOT yet roped.
+    /// gemma4 k_eq_v: V derives from the K projection via an unscaled RMSNorm.
     private func kv(_ x: MLXArray) -> (MLXArray, MLXArray) {
         let (B, S) = (x.dim(0), x.dim(1))
-        let k = kNorm(kProj(x).reshaped(B, S, nKVHeads, headDim)).transposed(0, 2, 1, 3)
-        let v = vProj(x).reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        let kp = kProj(x).reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        let k = kNorm(kp)
+        let v: MLXArray
+        if kEqV {
+            v = rmsNormNoScale(kp, eps: eps)
+        } else {
+            v = vProj!(x).reshaped(B, S, nKVHeads, headDim).transposed(0, 2, 1, 3)
+        }
         return (k, v)
     }
 
@@ -154,11 +185,13 @@ class DSparkAttention: Module {
 }
 
 class DSparkMLP: Module, UnaryLayer {
+    let useGelu: Bool
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
 
     init(_ config: DSparkConfiguration) {
+        self.useGelu = config.family == .gemma4
         let (h, i) = (config.hiddenSize, config.intermediateSize)
         _gate.wrappedValue = Linear(h, i, bias: false)
         _up.wrappedValue = Linear(h, i, bias: false)
@@ -166,26 +199,51 @@ class DSparkMLP: Module, UnaryLayer {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
+        down((useGelu ? geluApproximate(gate(x)) : silu(gate(x))) * up(x))
     }
 }
 
 class DSparkDecoderLayer: Module {
+    let sandwich: Bool  // gemma4: pre/post feedforward norms + layer_scalar
     @ModuleInfo(key: "self_attn") var selfAttn: DSparkAttention
     let mlp: DSparkMLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
+    @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: RMSNorm?
+    @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm: RMSNorm?
+    @ParameterInfo(key: "layer_scalar") var layerScalar: MLXArray?
 
     init(_ config: DSparkConfiguration) {
+        self.sandwich = config.family == .gemma4
         _selfAttn.wrappedValue = DSparkAttention(config)
         self.mlp = DSparkMLP(config)
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
         _postAttentionLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        if config.family == .gemma4 {
+            _preFeedforwardLayerNorm.wrappedValue = RMSNorm(
+                dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            _postFeedforwardLayerNorm.wrappedValue = RMSNorm(
+                dimensions: config.hiddenSize, eps: config.rmsNormEps)
+        } else {
+            _preFeedforwardLayerNorm.wrappedValue = nil
+            _postFeedforwardLayerNorm.wrappedValue = nil
+        }
+        self._layerScalar.wrappedValue = config.family == .gemma4 ? MLXArray.ones([1]) : nil
     }
 
     func callAsFunction(_ x: MLXArray, blockOffset: Int, cache: KVCache) -> MLXArray {
+        if sandwich {
+            var h = inputLayerNorm(x)
+            h = selfAttn.attend(h, blockOffset: blockOffset, cache: cache)
+            h = x + postAttentionLayerNorm(h)
+            let residual = h
+            var f = preFeedforwardLayerNorm!(h)
+            f = mlp(f)
+            f = postFeedforwardLayerNorm!(f)
+            return (residual + f) * layerScalar!
+        }
         let h = x + selfAttn.attend(inputLayerNorm(x), blockOffset: blockOffset, cache: cache)
         return h + mlp(postAttentionLayerNorm(h))
     }
@@ -208,9 +266,6 @@ public class DSparkDrafter: Module {
     public var hasConfidenceHead: Bool { confidenceHead != nil }
 
     public init(_ config: DSparkConfiguration) {
-        precondition(
-            config.family == .qwen3,
-            "DSparkDrafter currently supports the qwen3 drafter family only")
         self.config = config
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)

@@ -20,9 +20,6 @@ public enum DSparkDraftLoader {
         let configURL = directory.appendingPathComponent("config.json")
         let config = try JSONDecoder().decode(
             DSparkConfiguration.self, from: Data(contentsOf: configURL))
-        guard config.family == .qwen3 else {
-            throw DSparkLoadError.unsupportedFamily(config.modelType)
-        }
         let drafter = DSparkDrafter(config)
 
         var weights = [String: MLXArray]()
