@@ -71,6 +71,15 @@ public final class DSparkSession: @unchecked Sendable {
     private var reasoningSeconds: Double?
     private var decodeStart: Date?
 
+    // Adaptive draft on/off: measure both arms (ms per committed token) and run the
+    // faster one, probing the idle arm periodically. Kill switch MLXZ_DSPARK_ADAPTIVE=0
+    // (always draft). Output is unaffected — a plain step IS plain decode. The controller
+    // is SHARED across a model's sessions (injected by the scheduler; only touched inside
+    // the serialized container) so bootstrap is paid once per process.
+    static let adaptiveEnabled =
+        ProcessInfo.processInfo.environment["MLXZ_DSPARK_ADAPTIVE"] != "0"
+    private let controller: AdaptiveDraftController
+
     // Decode loop-carried state.
     /// The last committed+emitted token id — in neither cache; the next verify feeds it.
     private var pending: Int32 = 0
@@ -101,11 +110,13 @@ public final class DSparkSession: @unchecked Sendable {
         referenceTokens: [Int32] = [],
         blockCap: Int = 3,
         confidenceThreshold: Float = 0,
+        adaptiveController: AdaptiveDraftController? = nil,
         reasoningBudget: Int = 0,
         stopTokenIds: Set<Int>,
         continuation: AsyncStream<Generation>.Continuation,
         result: MTPCacheResult?
     ) {
+        self.controller = adaptiveController ?? AdaptiveDraftController()
         self.model = model
         self.drafter = drafter
         self.context = context
@@ -151,6 +162,7 @@ public final class DSparkSession: @unchecked Sendable {
     private var diagVerifyS = 0.0
     private var diagStepWallS = 0.0
     private var diagSteps = 0
+    private var diagPlainSteps = 0
     private var diagDrafted = 0
     private var diagAcceptHist = [Int](repeating: 0, count: 8)
     private var diagPositionDrafted = [Int](repeating: 0, count: 8)
@@ -250,14 +262,23 @@ public final class DSparkSession: @unchecked Sendable {
     /// decode remains. Must be called inside the container.
     public func decodeStepOnce() -> Bool {
         if stopped || ntoks >= maxTokens { finishDecode(); return false }
-        if Self.decodeDiag { diagSteps += 1 }
-        let stepT0 = Self.decodeDiag ? Date() : nil
-        defer { if let stepT0 { diagStepWallS += Date().timeIntervalSince(stepT0) } }
 
         if reasoningBudget > 0, inThink, !thinkForceClosed, reasoningTokens >= reasoningBudget {
             forceCloseThink()
             if stopped || ntoks >= maxTokens { finishDecode(); return false }
         }
+
+        // Adaptive arm selection: run plain decode steps when drafting isn't currently
+        // paying (the controller measures both arms and probes periodically). Selected
+        // BEFORE the diag counters so [DECODE]/[SPEC] stats describe spec rounds only
+        // (plain steps are counted separately).
+        if Self.adaptiveEnabled, controller.nextArm == .plain {
+            return plainStepsOnce(maxSteps: 6)
+        }
+        if Self.decodeDiag { diagSteps += 1 }
+        let stepT0 = Self.decodeDiag ? Date() : nil
+        defer { if let stepT0 { diagStepWallS += Date().timeIntervalSince(stepT0) } }
+        let roundT0 = Self.adaptiveEnabled ? Date() : nil
 
         // ---- 1. draft a block (backbone full-width; heads over the first `cap` only) ----
         let t0 = Self.decodeDiag ? Date() : nil
@@ -363,6 +384,12 @@ public final class DSparkSession: @unchecked Sendable {
         nCached += n + 1
         asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
 
+        if let roundT0 {
+            controller.record(
+                arm: .drafting,
+                msPerToken: Date().timeIntervalSince(roundT0) * 1000 / Double(committed.count))
+        }
+
         // ---- 5. emit committed tokens (stop token ends mid-block; it is not emitted) ----
         var lastEmitted: Int32? = nil
         for tok in committed {
@@ -371,6 +398,49 @@ public final class DSparkSession: @unchecked Sendable {
             if ntoks >= maxTokens { finishDecode(); return false }
         }
         pending = lastEmitted ?? committed.last!
+        return true
+    }
+
+    /// A BATCH of plain decode steps (M=1 target forwards — identical math to
+    /// non-speculative decode), used while the controller has drafting suspended. The
+    /// forwards chain LAZILY (each step's sampled token feeds the next without a host
+    /// sync) with one sync for the whole batch — the same pipelining the real plain path
+    /// gets — so the controller's plain estimate reflects the true alternative, not a
+    /// sync-per-token strawman. Taps still extend the drafter's context so drafting can
+    /// resume in sync at any batch boundary.
+    private func plainStepsOnce(maxSteps: Int) -> Bool {
+        let t0 = Date()
+        var tokens: [MLXArray] = []
+        var tapsList: [MLXArray] = []
+        var input = MLXArray([pending]).expandedDimensions(axis: 0)
+        for _ in 0 ..< maxSteps {
+            let (logits, taps) = model.forwardWithTaps(
+                input, cache: modelCache, tapLayers: tapLayers)
+            let tok = sampleRow(logits[0, -1, 0...])
+            asyncEval(tok)
+            tokens.append(tok)
+            tapsList.append(taps)
+            input = tok.reshaped([1, 1]).asType(.int32)
+        }
+        drafter.updateContext(concatenated(tapsList, axis: 1), ctxCaches: ctxCaches)
+        asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
+        nCached += maxSteps
+        let ids = tokens.map { $0.item(Int32.self) }  // one pipeline sync for the batch
+        if Self.decodeDiag { diagPlainSteps += maxSteps }
+        let msPerToken = Date().timeIntervalSince(t0) * 1000 / Double(maxSteps)
+        for _ in 0 ..< maxSteps {
+            controller.record(arm: .plain, msPerToken: msPerToken)
+        }
+        // Emit with stop/budget handling. On early stop the batch's remaining inputs sit
+        // as junk in the caches — harmless, the session is finished (DSpark sessions
+        // never share a live cache; prefix snapshots were captured during prefill).
+        var lastEmitted: Int32? = nil
+        for id in ids {
+            if emitToken(Int(id)) { finishDecode(); return false }
+            lastEmitted = id
+            if ntoks >= maxTokens { finishDecode(); return false }
+        }
+        pending = lastEmitted ?? ids.last!
         return true
     }
 
@@ -436,7 +506,8 @@ public final class DSparkSession: @unchecked Sendable {
             let drafterMs = String(format: "%.1f", diagDrafterS / steps * 1000)
             let verifyMs = String(format: "%.1f", diagVerifyS / steps * 1000)
             let wall = String(format: "%.1f", diagStepWallS / steps * 1000)
-            let accPerStep = String(format: "%.2f", Double(ntoks) / steps)
+            // Spec rounds only: each plain step commits exactly one token.
+            let accPerStep = String(format: "%.2f", Double(ntoks - diagPlainSteps) / steps)
             let hist = (0 ..< blockCap).map { i in
                 diagPositionDrafted[i] > 0
                     ? String(format: "%.2f", Double(diagAcceptHist[i]) / Double(diagPositionDrafted[i]))
@@ -444,8 +515,10 @@ public final class DSparkSession: @unchecked Sendable {
             }.joined(separator: ",")
             FileHandle.standardError.write(Data(
                 "[DECODE] ctx=\(promptCount) steps=\(diagSteps) gen=\(ntoks) drafter=\(drafterMs)ms verify=\(verifyMs)ms STEPWALL=\(wall)ms total=\(String(format: "%.1f", elapsed))s\n".utf8))
+            let estS = controller.specEstimate.map { String(format: "%.1f", $0) } ?? "-"
+            let estP = controller.plainEstimate.map { String(format: "%.1f", $0) } ?? "-"
             FileHandle.standardError.write(Data(
-                "[SPEC] steps=\(diagSteps) drafted=\(diagDrafted) cap=\(blockCap) acc/step=\(accPerStep) accHist=[\(hist)]\n".utf8))
+                "[SPEC] steps=\(diagSteps) plainSteps=\(diagPlainSteps) drafted=\(diagDrafted) cap=\(blockCap) acc/step=\(accPerStep) accHist=[\(hist)] adaptive=\(Self.adaptiveEnabled ? "on" : "off") mode=\(controller.mode == .drafting ? "draft" : "plain") spec=\(estS)ms plain=\(estP)ms\n".utf8))
         }
     }
 
