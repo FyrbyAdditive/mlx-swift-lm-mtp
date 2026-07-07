@@ -1928,6 +1928,23 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
 /// Standard KV cache - alias to KVCacheSimple for compatibility
 public typealias StandardKVCache = KVCacheSimple
 
+/// A `KVCacheSimple` that `maybeQuantizeKVCache` must NOT quantize. Used where numeric
+/// parity with an fp16 baseline path matters: e.g. DSpark's full-length stand-ins for
+/// Gemma4's sliding-window layers — the plain path's RotatingKVCache cannot be quantized
+/// (no toQuantized), so quantizing only the speculative arm's caches would make the two
+/// paths diverge far beyond kernel-shape noise (measured 3.9%/token vs a 0.17% ceiling).
+public final class PinnedPrecisionKVCache: KVCacheSimple {
+    public override func copy() -> any KVCache {
+        let new = PinnedPrecisionKVCache()
+        new.step = self.step
+        let s = self.state
+        if !s.isEmpty {
+            new.state = s.map { $0[.ellipsis] }
+        }
+        return new
+    }
+}
+
 // MARK: - Quantized Attention Operations
 
 /// Kill switch for the small-M causal row split in `quantizedScaledDotProductAttention`
@@ -2097,7 +2114,7 @@ public func maybeQuantizeKVCache(
 
     for i in 0 ..< cache.count {
         // Handle cache types that support quantization
-        if let simpleCache = cache[i] as? KVCacheSimple {
+        if let simpleCache = cache[i] as? KVCacheSimple, !(cache[i] is PinnedPrecisionKVCache) {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.

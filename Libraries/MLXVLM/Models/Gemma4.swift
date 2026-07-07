@@ -1,6 +1,7 @@
 import CoreImage
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import MLXNN
 
@@ -2069,8 +2070,129 @@ extension Gemma4: DSparkTargetModel {
     /// by the forced masks in `callWithTaps` instead — numerically identical, at the cost
     /// of unbounded sliding-layer KV growth (quantizable via kvBits like any other).
     public func dsparkCache(parameters: GenerateParameters?) -> [KVCache] {
-        let count = config.textConfiguration.hiddenLayers
-            - config.textConfiguration.numKVSharedLayers
-        return (0 ..< count).map { _ in StandardKVCache() }
+        Self.dsparkCaches(config.textConfiguration)
+    }
+
+    static func dsparkCaches(_ text: Gemma4TextConfiguration) -> [KVCache] {
+        let count = text.hiddenLayers - text.numKVSharedLayers
+        return (0 ..< count).map { idx in
+            // Sliding layers use PINNED-precision full caches: the plain path's rotating
+            // caches can't be quantized, so quantizing only the DSpark arm's would break
+            // numeric parity (measured 3.9%/token divergence vs a 0.17% kernel ceiling).
+            text.layerTypes[idx] == "full_attention"
+                ? StandardKVCache() : PinnedPrecisionKVCache()
+        }
+    }
+}
+
+
+// MARK: - gemma4_unified (text-only serving)
+
+/// Configuration for `gemma4_unified` checkpoints (audio+vision+text). Only the text
+/// tower is served — the language model is architecturally the gemma4 text model.
+public struct Gemma4UnifiedConfiguration: Codable, Sendable {
+    public let textConfiguration: Gemma4TextConfiguration
+    enum CodingKeys: String, CodingKey {
+        case textConfiguration = "text_config"
+    }
+}
+
+/// Minimal text processor for gemma4_unified: chat template + tokenize. The unified
+/// image/audio front-ends are not ported; image/audio inputs are not accepted.
+public struct Gemma4UnifiedProcessorConfiguration: Codable, Sendable {
+    public let processorClass: String
+    enum CodingKeys: String, CodingKey {
+        case processorClass = "processor_class"
+    }
+}
+
+public final class Gemma4UnifiedTextProcessor: UserInputProcessor, @unchecked Sendable {
+    private let tokenizer: Tokenizer
+    private let messageGenerator = DefaultMessageGenerator()
+
+    public init(_ config: Gemma4UnifiedProcessorConfiguration, tokenizer: any Tokenizer) {
+        self.tokenizer = tokenizer
+    }
+
+    public func prepare(input: UserInput) throws -> LMInput {
+        let messages = messageGenerator.generate(from: input)
+        let promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages, tools: input.tools, additionalContext: input.additionalContext)
+        return LMInput(tokens: MLXArray(promptTokens))
+    }
+}
+
+/// `gemma4_unified` served TEXT-ONLY: the `language_model` weights load into the same
+/// text model the plain gemma4 uses; the audio/vision towers are dropped at sanitize.
+/// Deliberately NOT a `VLMModel`, so the engine advertises text-only capabilities.
+public final class Gemma4UnifiedText: Module, MLXLLM.LLMModel, KVCacheDimensionProvider {
+    @ModuleInfo(key: "language_model") fileprivate var languageModel: Gemma4TextLanguageModel
+    public let config: Gemma4UnifiedConfiguration
+
+    public var vocabularySize: Int { config.textConfiguration.vocabularySize }
+    public var kvHeads: [Int] { languageModel.kvHeads }
+
+    public init(_ config: Gemma4UnifiedConfiguration) {
+        self.config = config
+        self._languageModel.wrappedValue = Gemma4TextLanguageModel(config.textConfiguration)
+        super.init()
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        languageModel.newCache(parameters: parameters)
+    }
+
+    public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        languageModel(inputs, cache: cache).logits
+    }
+
+    public var loraLayers: [Module] { languageModel.model.layers }
+
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        var sanitized: [String: MLXArray] = [:]
+        for (key, value) in weights {
+            // Drop the unported towers and rope caches; text weights pass through with
+            // their checkpoint paths (language_model.model.* matches the module tree).
+            if key.hasPrefix("embed_audio.") || key.hasPrefix("embed_vision.")
+                || key.hasPrefix("vision_embedder.") || key.contains("rotary_emb")
+            {
+                continue
+            }
+            sanitized[key] = value
+        }
+        return sanitized
+    }
+}
+
+extension Gemma4UnifiedText: DSparkTargetModel {
+    public func forwardWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> (logits: MLXArray, taps: MLXArray) {
+        let (normed, taps) = languageModel.model.callWithTaps(
+            inputs, cache: cache?.map { $0 as KVCache? }, tapLayers: tapLayers)
+        var logits: MLXArray
+        if let lmHead = languageModel.lmHead {
+            logits = lmHead(normed)
+        } else {
+            logits = languageModel.model.embedTokens.asLinear(normed)
+        }
+        if let cap = languageModel.finalLogitSoftcapping, cap > 0 {
+            let scale = MLXArray(cap)
+            logits = tanh(logits / scale) * scale
+        }
+        return (logits, taps)
+    }
+
+    public func prefillWithTaps(
+        _ inputs: MLXArray, cache: [KVCache]?, tapLayers: [Int]
+    ) -> MLXArray {
+        languageModel.model.callWithTaps(
+            inputs, cache: cache?.map { $0 as KVCache? }, tapLayers: tapLayers
+        ).taps
+    }
+
+    /// Full-length caches for every layer (see Gemma4.dsparkCache).
+    public func dsparkCache(parameters: GenerateParameters?) -> [KVCache] {
+        Gemma4.dsparkCaches(config.textConfiguration)
     }
 }
