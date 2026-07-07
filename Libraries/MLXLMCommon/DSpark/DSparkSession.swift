@@ -80,6 +80,13 @@ public final class DSparkSession: @unchecked Sendable {
         ProcessInfo.processInfo.environment["MLXZ_DSPARK_ADAPTIVE"] != "0"
     private let controller: AdaptiveDraftController
 
+    // Prompt-lookup drafting: free drafts on copy runs (quoting, code edits, tool
+    // echoes) — fires BEFORE arm selection (no drafter forward; wins in both modes).
+    // Kill switch MLXZ_DSPARK_LOOKUP=0.
+    static let lookupEnabled =
+        ProcessInfo.processInfo.environment["MLXZ_DSPARK_LOOKUP"] != "0"
+    private let lookup = NGramIndex(minN: 4, maxN: 5, maxDraft: 6)
+
     // Decode loop-carried state.
     /// The last committed+emitted token id — in neither cache; the next verify feeds it.
     private var pending: Int32 = 0
@@ -167,6 +174,7 @@ public final class DSparkSession: @unchecked Sendable {
     private var diagStepWallS = 0.0
     private var diagSteps = 0
     private var diagPlainSteps = 0
+    private var diagLookupRounds = 0
     private var diagDrafted = 0
     private var diagAcceptHist = [Int](repeating: 0, count: 8)
     private var diagPositionDrafted = [Int](repeating: 0, count: 8)
@@ -248,6 +256,8 @@ public final class DSparkSession: @unchecked Sendable {
         result?.prefillSeconds = Date().timeIntervalSince(prefillStart ?? start)
         nCached = promptCount
         cachedTokens = promptTokensArray
+        lookup.extend(promptTokensArray)
+        lookup.extend([tok.item(Int32.self)])
         pending = tok.item(Int32.self)
         phase = .decoding
         if Self.decodeDiag || reasoningBudget > 0 { decodeStart = Date() }
@@ -271,6 +281,14 @@ public final class DSparkSession: @unchecked Sendable {
         if reasoningBudget > 0, inThink, !thinkForceClosed, reasoningTokens >= reasoningBudget {
             forceCloseThink()
             if stopped || ntoks >= maxTokens { finishDecode(); return false }
+        }
+
+        // Prompt-lookup drafting first: a confident n-gram hit gives a free draft (no
+        // drafter forward), verified exactly like any other draft. Fires in BOTH
+        // controller modes; misses cost nothing and fall through.
+        if Self.lookupEnabled {
+            let lkDraft = lookup.propose()
+            if !lkDraft.isEmpty { return lookupRoundOnce(draft: lkDraft) }
         }
 
         // Adaptive arm selection: run plain decode steps when drafting isn't currently
@@ -389,6 +407,7 @@ public final class DSparkSession: @unchecked Sendable {
         nCached += n + 1
         cachedTokens.append(pending)
         cachedTokens.append(contentsOf: committed.prefix(n))
+        lookup.extend(committed)
         asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
 
         if let roundT0 {
@@ -398,6 +417,63 @@ public final class DSparkSession: @unchecked Sendable {
         }
 
         // ---- 5. emit committed tokens (stop token ends mid-block; it is not emitted) ----
+        var lastEmitted: Int32? = nil
+        for tok in committed {
+            if emitToken(Int(tok)) { finishDecode(); return false }
+            lastEmitted = tok
+            if ntoks >= maxTokens { finishDecode(); return false }
+        }
+        pending = lastEmitted ?? committed.last!
+        return true
+    }
+
+    /// One LOOKUP round: verify a drafter-free n-gram draft (continuation of an earlier
+    /// occurrence of the current suffix) in one target forward. Greedy accept is the
+    /// fused exact-argmax rule; at temperature > 0 the proposal is a point mass (q =
+    /// one-hot), so min(1, p/q) reduces to accepting w.p. p(x) with residual = p
+    /// renormalized without x — still an exact target sample.
+    private func lookupRoundOnce(draft: [Int32]) -> Bool {
+        if Self.decodeDiag { diagLookupRounds += 1 }
+        let verifyIds = concatenated([MLXArray([pending]), MLXArray(draft)])
+            .expandedDimensions(axis: 0)
+        let (vLogits, vTaps) = model.forwardWithTaps(
+            verifyIds, cache: modelCache, tapLayers: tapLayers)
+        let L = draft.count
+        let n: Int
+        var committed: [Int32]
+        if isGreedy {
+            let targetArgmax = argMax(vLogits[0], axis: -1).asType(.int32)
+            let match = (MLXArray(draft) .== targetArgmax[0 ..< L]).asType(.int32)
+            let nArr = cumprod(match).sum()
+            eval(nArr, targetArgmax)
+            n = nArr.item(Int.self)
+            let tt = targetArgmax.asArray(Int32.self)
+            committed = Array(draft.prefix(n))
+            committed.append(tt[n])
+        } else {
+            let p = SpeculativeVerifier.truncateProbs(
+                softmax(vLogits[0].asType(.float32) * (1 / temp), axis: -1),
+                topP: topP, topK: topK)
+            var oneHot = [Float](repeating: 0, count: L * drafter.config.vocabularySize)
+            for (i, t) in draft.enumerated() {
+                oneHot[i * drafter.config.vocabularySize + Int(t)] = 1
+            }
+            let q = MLXArray(oneHot, [L, drafter.config.vocabularySize])
+            let uniforms = uniform(Float(0) ..< Float(1), [L])
+            let (accepted, replacement) = SpeculativeVerifier.sampledAccept(
+                targetProbs: p, draftTokens: draft, draftProbs: q, uniforms: uniforms)
+            n = accepted
+            committed = Array(draft.prefix(n))
+            committed.append(replacement)
+        }
+        let trim = L - n
+        if trim > 0 { trimPromptCache(modelCache, numTokens: trim) }
+        drafter.updateContext(vTaps[0..., 0 ..< (n + 1), 0...], ctxCaches: ctxCaches)
+        nCached += n + 1
+        cachedTokens.append(pending)
+        cachedTokens.append(contentsOf: committed.prefix(n))
+        lookup.extend(committed)
+        asyncEval(ctxCaches.map { $0.state }.flatMap { $0 })
         var lastEmitted: Int32? = nil
         for tok in committed {
             if emitToken(Int(tok)) { finishDecode(); return false }
@@ -435,6 +511,7 @@ public final class DSparkSession: @unchecked Sendable {
         let ids = tokens.map { $0.item(Int32.self) }  // one pipeline sync for the batch
         cachedTokens.append(pending)
         cachedTokens.append(contentsOf: ids.prefix(maxSteps - 1))
+        lookup.extend(ids)
         if Self.decodeDiag { diagPlainSteps += maxSteps }
         let msPerToken = Date().timeIntervalSince(t0) * 1000 / Double(maxSteps)
         for _ in 0 ..< maxSteps {
@@ -535,7 +612,7 @@ public final class DSparkSession: @unchecked Sendable {
             let estS = controller.specEstimate.map { String(format: "%.1f", $0) } ?? "-"
             let estP = controller.plainEstimate.map { String(format: "%.1f", $0) } ?? "-"
             FileHandle.standardError.write(Data(
-                "[SPEC] steps=\(diagSteps) plainSteps=\(diagPlainSteps) drafted=\(diagDrafted) cap=\(blockCap) acc/step=\(accPerStep) accHist=[\(hist)] adaptive=\(Self.adaptiveEnabled ? "on" : "off") mode=\(controller.mode == .drafting ? "draft" : "plain") spec=\(estS)ms plain=\(estP)ms\n".utf8))
+                "[SPEC] steps=\(diagSteps) plainSteps=\(diagPlainSteps) lookupRounds=\(diagLookupRounds) drafted=\(diagDrafted) cap=\(blockCap) acc/step=\(accPerStep) accHist=[\(hist)] adaptive=\(Self.adaptiveEnabled ? "on" : "off") mode=\(controller.mode == .drafting ? "draft" : "plain") spec=\(estS)ms plain=\(estP)ms\n".utf8))
         }
     }
 
