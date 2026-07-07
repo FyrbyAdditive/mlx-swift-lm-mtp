@@ -1930,6 +1930,11 @@ public typealias StandardKVCache = KVCacheSimple
 
 // MARK: - Quantized Attention Operations
 
+/// Kill switch for the small-M causal row split in `quantizedScaledDotProductAttention`
+/// (set MLXZ_QKV_ROWSPLIT=0 to fall back to the single multi-row quantized matmul).
+private let rowSplitEnabled =
+    ProcessInfo.processInfo.environment["MLXZ_QKV_ROWSPLIT"] != "0"
+
 public func quantizedScaledDotProductAttention(
     queries: MLXArray,
     quantizedKeys: (MLXArray, MLXArray, MLXArray?),
@@ -1963,6 +1968,41 @@ public func quantizedScaledDotProductAttention(
             expandedDimensions(qValues.1, axis: -3),
             qValues.2 == nil ? nil : expandedDimensions(qValues.2!, axis: -3)
         )
+    }
+
+    // Small-M causal fast path (speculative verify, MTP 2-token steps, chunk tails):
+    // a single M-row quantized matmul falls into a slow small-M kernel regime (measured
+    // 2.5–7× per-step penalty vs M=1, growing with context — see mlxz
+    // docs/dspark/findings.md). SDPA rows are independent and causality can be enforced
+    // by slicing each row's key prefix, so M independent single-row attentions — each on
+    // the fast qmv path, exactly the kernel plain decode uses — produce the identical
+    // result. Kill switch: MLXZ_QKV_ROWSPLIT=0.
+    if rowSplitEnabled, L > 1, L <= 8, case .causal = mask {
+        let kL = qKeys.0.dim(-2)
+        var rows: [MLXArray] = []
+        rows.reserveCapacity(L)
+        for i in 0 ..< L {
+            // Row i (aligned to the cache tail) attends keys [0, kL - L + i].
+            let kEnd = kL - L + i + 1
+            let q = scaledQueries[.ellipsis, i ..< (i + 1), 0...]
+            var s = quantizedMM(
+                q, qKeys.0[.ellipsis, ..<kEnd, 0...],
+                scales: qKeys.1[.ellipsis, ..<kEnd, 0...],
+                biases: qKeys.2.map { $0[.ellipsis, ..<kEnd, 0...] },
+                transpose: true, groupSize: groupSize, bits: bits, mode: mode)
+            s = softmax(s, axis: -1)
+            rows.append(
+                quantizedMM(
+                    s, qValues.0[.ellipsis, ..<kEnd, 0...],
+                    scales: qValues.1[.ellipsis, ..<kEnd, 0...],
+                    biases: qValues.2.map { $0[.ellipsis, ..<kEnd, 0...] },
+                    transpose: false, groupSize: groupSize, bits: bits, mode: mode))
+        }
+        var output = concatenated(rows, axis: -2)
+        if nRepeats > 1 {
+            output = output.reshaped([B, nQHeads, L, D])
+        }
+        return output
     }
 
     // Compute attention scores using quantized matmul
